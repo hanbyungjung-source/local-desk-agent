@@ -1,0 +1,6 @@
+﻿__pycache__/
+*.pyc
+.venv/
+desktop_agent/data/
+desktop_agent/agemt_work_folder/
+*.gguf
