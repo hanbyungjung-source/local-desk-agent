@@ -237,10 +237,19 @@ class Tools:
             raise Halted('Stopped by user')
 
     def check_permission(self, action):
+        from desktop_agent.protocol import COMPOSITE_TOOLS
         if tool_policy(self.tool_policies,action['tool']) == 'disabled':
             raise ValueError('Tool disabled by user: '+action['tool'])
         if action['tool'] == 'job_start':
             self.check_permission(action['arguments']['action'])
+        if action['tool'] in COMPOSITE_TOOLS:
+            for child in action['arguments']['actions']:
+                self.check_permission(child)
+        name = action['tool']
+        if name.startswith('desktop_') and not (self.allow_screen if name in ('desktop_capture','desktop_screen_capture','desktop_record') else self.allow_input):
+            raise ValueError('Screen capture disabled' if name in ('desktop_capture','desktop_screen_capture','desktop_record') else 'Desktop input disabled')
+        if name.startswith('browser_') and not self.allow_browser:
+            raise ValueError('Browser access disabled')
 
     def authorize(self, action, context=None):
         self.check()
@@ -254,11 +263,66 @@ class Tools:
         self.check_permission(action)
         self.notify('approval_log',{'tool':action['tool'],'mode':'confirmed' if reason else 'automatic','reason':reason})
 
+    def run_macro(self, action):
+        import uuid
+        self.authorize(action)
+        arguments = action['arguments']
+        parent_call = self.call_id
+        self.directory.mkdir(parents=True,exist_ok=True)
+        journal = self.directory/('macro-'+uuid.uuid4().hex+'.jsonl')
+        completed = completed_actions = 0
+        last = None
+        error = interrupted = ''
+        with journal.open('x',encoding='utf-8') as stream:
+            stream.write(json.dumps({'action':action,'call_id':parent_call},ensure_ascii=False)+'\n')
+            try:
+                for repetition in range(arguments['repeat']):
+                    if repetition and self.stopped.wait(arguments['interval_ms']/1000):
+                        raise Halted('Macro cancelled between repetitions')
+                    for index,child in enumerate(arguments['actions']):
+                        self.check()
+                        child = dict(child)
+                        if action['risk']=='sensitive':
+                            child['risk']='sensitive'
+                        self.call_id = f'{parent_call or journal.stem}:{repetition+1}:{index+1}'
+                        try:
+                            result = self.execute(child)
+                        except Exception as failure:
+                            result = ToolResult(str(failure),error=str(failure),interrupted=str(failure) if isinstance(failure,Halted) else '')
+                        last = dict(iteration=repetition+1,step=index+1,tool=child['tool'],call_id=self.call_id,
+                                    text=result.text,error=result.error,interrupted=result.interrupted)
+                        stream.write(json.dumps(last,ensure_ascii=False)+'\n')
+                        stream.flush()
+                        if result.error or result.interrupted:
+                            error,interrupted = result.error,result.interrupted
+                            break
+                        completed_actions += 1
+                    else:
+                        completed += 1
+                        self.notify('tool_progress',dict(tool=action['tool'],completed=completed,total=arguments['repeat'],call_id=parent_call))
+                        continue
+                    break
+            except Exception as failure:
+                error = str(failure)
+                interrupted = str(failure) if isinstance(failure,Halted) else ''
+            finally:
+                self.call_id = parent_call
+            summary = dict(status='stopped' if interrupted else 'error' if error else 'completed',
+                           completed_iterations=completed,completed_actions=completed_actions,
+                           requested_iterations=arguments['repeat'],steps_per_iteration=len(arguments['actions']),
+                           last_action={key:value[:2000] if isinstance(value,str) else value for key,value in last.items()} if last else None,
+                           log_path=str(journal.resolve()),call_id=parent_call,error=error,interrupted=interrupted,
+                           replay_safe=False)
+            stream.write(json.dumps({'summary':summary},ensure_ascii=False)+'\n')
+        return ToolResult(json.dumps(summary,ensure_ascii=False),error=error,interrupted=interrupted,call_id=parent_call)
+
     def execute(self, action):
         validate_action(action)
         self.check()
         self.check_permission(action)
         name, arguments = action['tool'], action['arguments']
+        if name in ('desktop_macro','browser_macro'):
+            return self.run_macro(action)
         if name.startswith('terminal_') and name in WORKSPACE_TOOLS:
             if self.terminals is None:
                 raise ValueError('Terminal session is unavailable')

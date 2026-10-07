@@ -87,6 +87,15 @@ def tool_schemas(names):
                           'additionalProperties': False}}} for name in names for _, parameters in [TOOLS[name]]]
 
 
+MACRO_TOOLS = {
+    'desktop_macro': ('desktop_type','desktop_key','desktop_click','desktop_scroll'),
+    'browser_macro': ('browser_type','browser_key','browser_click','browser_scroll'),
+}
+for macro, children in MACRO_TOOLS.items():
+    TOOLS[macro] = ('Repeat ordered actions on one target; stop on failure. interval_ms waits AFTER each complete repetition except the last, not a real-time start interval. Cancellable; never replay partial work.', {
+        'actions':{'type':'array','minItems':1,'maxItems':32,'items':{'oneOf':tool_schemas(children)}},
+        'repeat':{'type':'integer','minimum':1,'maximum':1000},
+        'interval_ms':{'type':'integer','minimum':0,'maximum':60000}})
 BACKGROUND_TOOLS = tuple(name for name in TOOLS if name.startswith(('desktop_','browser_')))
 TOOLS.update({
     'job_start':('Start a tool independently; other tools may run during recording/waits. Returns job_id. Collect with job_result.',
@@ -124,6 +133,10 @@ WORKSPACE_TOOLS = {
     'terminal_stop':('Stop only this session owned execution and its job process tree; cannot stop an arbitrary PID.',{'execution_id':text(40)}),
 }
 TOOLS.update(WORKSPACE_TOOLS)
+PARALLEL_TOOLS = ('workspace_read','workspace_search','browser_read','browser_tabs','terminal_output')
+TOOLS['tool_parallel'] = ('Run up to four independent read-only calls; results preserve input order. Same browser remains serialized. No dependencies between calls.', {
+    'actions':{'type':'array','minItems':1,'maxItems':4,'items':{'oneOf':tool_schemas(PARALLEL_TOOLS)}}})
+COMPOSITE_TOOLS = dict(MACRO_TOOLS,tool_parallel=PARALLEL_TOOLS)
 TOOL_POLICIES = ('disabled','ask','allow')
 
 
@@ -140,13 +153,15 @@ def action_schema():
 
 TOOL_GROUPS = {
     'browser': ('Managed browser navigation, page text, clicks, typing and tabs.',
-                tuple(name for name in TOOLS if name.startswith('browser_') and name not in ('browser_record','browser_hold','browser_drag','browser_key_queue'))),
+                tuple(name for name in TOOLS if name.startswith('browser_') and name not in ('browser_record','browser_hold','browser_drag','browser_key_queue','browser_macro'))),
     'recording': ('Silent window/browser video; optional background recording while interacting.',('desktop_record','browser_record','job_status','job_result','job_cancel')),
     'advanced_input': ('Key queues, held keys/buttons, timed drags, scancode and window-message input.',
                        ('desktop_input','desktop_hold','desktop_drag_timed','desktop_key_queue','browser_key_queue','browser_hold','browser_drag')),
     'files': ('Read registered attachments, view images/video, retrieve full history or an exact stored event.',('file_read','file_view','session_history','session_record')),
     'workspace': ('Read/search and patch files in the selected workspace.',tuple(name for name in WORKSPACE_TOOLS if name.startswith('workspace_'))),
     'terminal': ('Visible, non-interactive PowerShell executions, output and cancellation.',tuple(name for name in WORKSPACE_TOOLS if name.startswith('terminal_'))),
+    'automation': ('Ordered repeated input and independent parallel reads.',
+                   ('desktop_macro','browser_macro','tool_parallel','job_status','job_result','job_cancel')),
 }
 BASE_TOOLS = ('finish','window_list','window_select','desktop_capture','desktop_screen_capture',
               'desktop_click','desktop_type','desktop_key','desktop_scroll','desktop_drag')
@@ -165,6 +180,8 @@ ARGUMENT_DEFAULTS = {
     'workspace_symbols': {'path':'.','kind':'definitions','limit':30},
     'terminal_start': {'cwd':'.','timeout_seconds':600},
     'terminal_output': {'offset':0,'limit':12000},
+    'desktop_macro': {'repeat':1,'interval_ms':0},
+    'browser_macro': {'repeat':1,'interval_ms':0},
 }
 
 
@@ -177,7 +194,8 @@ class ToolCatalog:
                  'advanced_input':r'hold|drag|queue|scancode|\uae38\uac8c|\ub204\ub974\uace0|\ub4dc\ub798\uadf8|\ube44\ud65c\uc131|\ud0a4 \ud050|\uc7a5\uce58 \ubc29\uc2dd',
                  'files':r'file|attach|history|\ucca8\ubd80|\ud30c\uc77c|\ubb38\uc11c|\uae30\ub85d',
                  'workspace':r'file|code|workspace|edit|patch|\ud30c\uc77c|\ud3b8\uc9d1|\ucf54\ub4dc',
-                 'terminal':r'terminal|powershell|shell|command|\ud130\ubbf8\ub110|\uba85\ub839|\uc2e4\ud589'}
+                 'terminal':r'terminal|powershell|shell|command|\ud130\ubbf8\ub110|\uba85\ub839|\uc2e4\ud589',
+                 'automation':r'macro|repeat|parallel|queue|\ub9e4\ud06c\ub85c|\ubc18\ubcf5|\ubcd1\ub82c|\ud050|\uac04\uaca9'}
         for group,pattern in hints.items():
             if (re.search(pattern,prompt,re.I) or (group == 'files' and attachments)) and self.available(group):
                 self.loaded.add(group)
@@ -219,7 +237,15 @@ class ToolCatalog:
             if nested.get('tool') not in allowed:
                 raise ValueError('Background tool not loaded or not permitted')
             allowed = (*allowed,'job_start')
-        return normalize_call(call,allowed)
+        action = normalize_call(call,allowed)
+        def check_children(parent):
+            children = [parent['arguments']['action']] if parent['tool']=='job_start' else parent['arguments'].get('actions',[])
+            for child in children:
+                if child['tool'] not in allowed:
+                    raise ValueError('Child tool not loaded or not permitted')
+                check_children(child)
+        check_children(action)
+        return action
 
 
 def compact_call(action):
@@ -232,6 +258,8 @@ def compact_call(action):
         if action['message'] not in ('Start '+arguments['action']['tool'],'job_start'):
             nested['arguments']['commentary']=action['message']
         return nested
+    if name in COMPOSITE_TOOLS:
+        arguments['actions'] = [compact_call(child) for child in arguments['actions']]
     keep = {'x','y'} if arguments.get('kind') in ('click','mouse','scroll') or arguments.get('mode') == 'message' else set()
     for key,value in ARGUMENT_DEFAULTS.get(name,{}).items():
         if key not in keep and arguments.get(key) == value:
@@ -266,6 +294,10 @@ def compact_parameters(name):
                 'minItems':1,'maxItems':len(TOOL_GROUPS)},'commentary':text(1200)},'required':['groups'],'additionalProperties':False}
     from copy import deepcopy
     parameters = deepcopy(TOOLS[name][1])
+    if name in COMPOSITE_TOOLS:
+        parameters['actions']['items'] = compact_schema(COMPOSITE_TOOLS[name])
+        for child in parameters['actions']['items']['oneOf']:
+            child['properties']['arguments']['properties'].pop('background',None)
     pixel_tool = name.startswith('desktop_') and 'x' in parameters
     if pixel_tool:
         for key in ('x','y','end_x','end_y'):
@@ -301,6 +333,10 @@ def compact_schema(names):
                     for name in names]}
 
 
+class InvalidToolCall(ValueError):
+    pass
+
+
 def normalize_call(call, allowed=None):
     if not isinstance(call,dict):
         raise ValueError('Expected tool and arguments')
@@ -331,6 +367,10 @@ def normalize_call(call, allowed=None):
     if name == 'finish':
         return validate_action(dict(message=arguments['text'],tool=name,arguments={},risk='routine'))
     values = dict(ARGUMENT_DEFAULTS.get(name,{}),**arguments)
+    if name in COMPOSITE_TOOLS:
+        if not isinstance(values['actions'],list):
+            raise ValueError('Invalid actions')
+        values['actions'] = [normalize_call(child,COMPOSITE_TOOLS[name]) for child in values['actions']]
     if 'steps' in values:
         if not isinstance(values['steps'],list) or any(not isinstance(step,dict) for step in values['steps']):
             raise ValueError('Invalid key steps')
@@ -363,6 +403,10 @@ def require_pixel_coordinates(action):
     if action['tool']=='job_start':
         return require_pixel_coordinates(action['arguments']['action'])
     name,arguments = action['tool'],action['arguments']
+    if name in COMPOSITE_TOOLS:
+        for child in arguments['actions']:
+            require_pixel_coordinates(child)
+        return
     if not name.startswith('desktop_') or 'x' not in TOOLS.get(name,('',{}))[1]:
         return
     if name in ('desktop_input','desktop_hold') and arguments.get('kind') in ('key','text') and arguments.get('mode')!='message':
@@ -374,8 +418,9 @@ def require_pixel_coordinates(action):
 def validate_argument(value, spec, key):
     if 'oneOf' in spec:
         validate_action(value)
-        if value['tool'] not in BACKGROUND_TOOLS:
-            raise ValueError('Tool cannot run as background job')
+        allowed = {choice['properties']['tool']['enum'][0] for choice in spec['oneOf']}
+        if value['tool'] not in allowed:
+            raise ValueError('Tool not allowed in this action group')
     elif spec['type'] == 'integer':
         if type(value) is not int or not spec['minimum'] <= value <= spec['maximum']:
             raise ValueError('Invalid numeric argument: '+key)
@@ -417,6 +462,9 @@ def validate_action(action):
         validate_argument(arguments[key],spec,key)
     if 'steps' in arguments and sum(step['delay_ms'] for step in arguments['steps']) > 60000:
         raise ValueError('Queue delay exceeds 60000ms')
+    if name in MACRO_TOOLS:
+        if arguments['repeat']*len(arguments['actions']) > 10000 or (arguments['repeat']-1)*arguments['interval_ms'] > 3600000:
+            raise ValueError('Macro exceeds 10000 actions or one hour of interval waits')
     if name == 'finish' and not action['message'].strip():
         raise ValueError('Empty final reply')
     if 'selector' in arguments and not arguments['selector'].strip():

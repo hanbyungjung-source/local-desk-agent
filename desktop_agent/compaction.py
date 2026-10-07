@@ -41,27 +41,50 @@ class Compactor:
     def __init__(self, store, model, stopped, notify):
         self.store,self.model,self.stopped,self.notify=store,model,stopped,notify
         self.attempts=0
+        self.target_limited=False
 
     def prepare(self, identifier, events, system, budget, state, request_id):
         from desktop_agent.agent import context_text,pack_messages
         saved=restore_summary(self.store,identifier,events)
         covered=set(saved['covered_ids']) if saved else set()
         visible=[event for event in events if event.get('id') not in covered]
-        if not self.model.settings.auto_compact or self.attempts>=2:
+        self.model.settings.validate_compaction()
+        if not self.model.settings.auto_compact or self.attempts>=2 or self.target_limited:
             return visible,memory_record(saved),covered
+        trigger_budget=budget*self.model.settings.compaction_trigger_percent//100
+        target_budget=budget*self.model.settings.compaction_target_percent//100
         probe={}
         try:
-            pack_messages(visible,system,self.model.count,int(budget*.85),state=state,selection=probe,memory=memory_record(saved))
+            pack_messages(visible,system,self.model.count,trigger_budget,state=state,selection=probe,memory=memory_record(saved))
         except ValueError:
             return visible,memory_record(saved),covered
-        candidates=set(probe.get('excluded_ids',[]))
+        if not probe.get('excluded_ids'):
+            return visible,memory_record(saved),covered
+        target_probe={}
+        summary_reserve=min(1024,max(1,target_budget//4))
+        try:
+            pack_messages(visible,system,self.model.count,max(1,target_budget-summary_reserve),
+                          state=state,selection=target_probe,memory=memory_record(saved))
+            candidates=set(target_probe.get('excluded_ids',[]))
+        except ValueError:
+            candidates={event['id'] for event in visible}
         protected={event.get('id') for event in visible[-6:]}
         protected.add(request_id)
         pending_ids={row.get('call_id') for row in state.get('pending_jobs',[]) if row.get('call_id')}
         pending_ids.update(row.get('call_id') for row in state.get('terminals',[]) if row.get('status') in ('running','starting') and row.get('call_id'))
-        for event in visible:
-            if event.get('metadata',{}).get('call_id') in pending_ids:
+        linked=linked_events(visible)
+        call_groups={}
+        for event in linked:
+            metadata=event.get('metadata',{})
+            if metadata.get('call_id') in pending_ids or metadata.get('origin_call_id') in pending_ids:
                 protected.add(event.get('id'))
+            if metadata.get('call_id'):
+                call_groups.setdefault(metadata['call_id'],set()).add(event['id'])
+        for group in call_groups.values():
+            if group & protected:
+                protected.update(group)
+            elif group & candidates:
+                candidates.update(group)
         candidates-=protected
         if not candidates:
             return visible,memory_record(saved),covered
@@ -70,21 +93,25 @@ class Compactor:
         def summary_messages(rows):
             return [dict(role='system',content=summary_system),dict(role='user',content=json.dumps(
                 dict(previous_summary=memory_record(saved),records=rows),ensure_ascii=False))]
-        for event in linked_events(visible):
+        groups={}
+        record_by_id={}
+        for event in linked:
             if event.get('id') not in candidates:
                 continue
             if event['role'] in ('tool','system'):
                 record=result_record(event)
             else:
                 record=dict(id=event['id'],role=event['role'],content=preview(event['content'],2500))
-            if record is None:
-                selected.append(event['id'])
-                continue
-            draft=[*records,record]
+            record_by_id[event['id']]=record
+            key=('call',event['metadata']['call_id']) if event.get('metadata',{}).get('call_id') else ('event',event['id'])
+            groups.setdefault(key,[]).append(event['id'])
+        for group in groups.values():
+            draft_ids=sorted([*selected,*group])
+            draft=[record_by_id[identifier] for identifier in draft_ids if record_by_id[identifier] is not None]
             messages=summary_messages(draft)
             if self.model.count(context_text(messages))>max(1000,self.model.settings.context_limit-self.model.settings.output_budget-512):
                 break
-            records=draft;selected.append(event['id'])
+            records=draft;selected=draft_ids
         if not records:
             return visible,memory_record(saved),covered
         self.attempts+=1
@@ -109,9 +136,19 @@ class Compactor:
             pack_messages(new_visible,system,self.model.count,budget,state=state,memory=memory_record(candidate),selection=final_selection)
             if set(final_selection['excluded_ids']) & protected:
                 raise ValueError('Summary cannot retain the current request and recent work within context')
+            _,_,retained_tokens=pack_messages(new_visible,system,self.model.count,float('inf'),state=state,memory=memory_record(candidate))
+            target_met=retained_tokens<=target_budget
+            self.target_limited=not target_met
+            candidate['compaction']=dict(trigger_percent=self.model.settings.compaction_trigger_percent,
+                                         target_percent=self.model.settings.compaction_target_percent,
+                                         input_budget=budget,target_tokens=target_budget,retained_tokens=retained_tokens,
+                                         target_met=target_met,summary_reserve_tokens=summary_reserve)
             self.store.save_context_summary(identifier,candidate)
             self.store.append(identifier,'system',candidate['text'],status='compaction',
-                              covered_ids=selected,summary_characters=len(candidate['text']),metrics=metrics)
+                              covered_ids=selected,summary_characters=len(candidate['text']),metrics=metrics,
+                              compaction=candidate['compaction'])
+            if not target_met:
+                self.notify('status','Context summary target not reached; protected records retained. No automatic retry in this request.')
             self.notify('refresh',None)
             return new_visible,memory_record(candidate),set(combined)
         except Exception as error:

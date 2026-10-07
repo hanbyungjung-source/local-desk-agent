@@ -2,7 +2,7 @@
 
 로컬 GGUF 모델(llama.cpp 서버) 또는 외부 API를 선택해 쓰는 Windows용 채팅·작업 에이전트입니다. 화면 캡처, 파일 첨부, 작업 폴더 읽기·검색·수정, PowerShell 실행 같은 도구를 **사용자 승인 아래** 호출합니다.
 
-[구형·이종 GPU LLM 최적화 연구](https://github.com/hanbyungjung-source/dual-gpu-llm-optimization)의 측정 환경이기도 합니다. 연구에서 채택한 배치·런타임은 이 앱의 실제 텍스트·이미지 요청으로 검증했습니다.
+[구형·이종 GPU LLM 최적화 연구](https://github.com/hanbyungjung-source/dual-gpu-llm-optimization)의 측정 환경이기도 합니다. 연구에서 채택한 배치·런타임은 이 앱의 실제 텍스트·이미지 요청으로 검증했습니다. 로컬 GPU로 부족한 작업은 직접 구축한 [Kaggle T4×2 OpenAI 호환 추론 서버](https://github.com/hanbyungjung-source/t4-llm-serving)에 연결해 같은 앱에서 사용합니다.
 
 GitHub Copilot 에이전트와 함께 개발했으며, 요구사항·설계 결정·검증 기준은 본인이 정했습니다.
 
@@ -11,10 +11,13 @@ GitHub Copilot 에이전트와 함께 개발했으며, 요구사항·설계 결�
 | 영역 | 내용 |
 |---|---|
 | 모델 | 로컬 GGUF(모델별 실행 프리셋, KV 캐시 정밀도 선택) / OpenAI 호환·Vertex 등 외부 API 프로필 |
+| 원격 엔진 | Kaggle T4×2 자가호스팅 서버(Qwen3.8 27B, 192K 문맥, MTP 투기적 디코딩) 원클릭 연결. 키 없는 요청 401·모델 목록 확인 후에만 프로필 저장 |
+| 추론 제어 | 사고 강도(`low / medium / xhigh`)와 별도의 사고 토큰 예산. 예산 소진 시 응답을 끊지 않고 답변으로 전환 |
 | 도구 | 화면 캡처, 파일 첨부(PDF 등), 작업 폴더 읽기·검색·해시 기반 단일 블록 수정, 비대화형 PowerShell |
+| 자동화 | 반복 매크로(`desktop_macro`, `browser_macro`)와 독립 읽기 도구 최대 4개 병렬 묶음(`tool_parallel`). 하위 도구 승인은 그대로 적용 |
 | 승인 | 도구별 `사용 안 함 / 매번 확인 / 허용`. 파일 수정·셸 실행은 변경 차이와 명령을 확인받음 |
 | 코드 검색 | BM25 + Tree-sitter 기반 로컬 코드 검색·심볼 탐색(Python, C/C++, C#, Java 등) |
-| 문맥 관리 | 대화 자동 압축(원문 보존), KV 캐시 재사용 표시, 호출 ID 기반 도구 이력 |
+| 문맥 관리 | 대화 자동 압축(원문 보존, 시작·목표 비율 사용자 설정, 기본 85%→65%), KV 캐시 재사용 표시, 호출 ID 기반 도구 이력 |
 | 자원 감시 | GPU 전용·공유 메모리와 RAM 상한 감시, 초과 시 해당 서버만 중단 |
 | 보안 | API 키는 Windows DPAPI로 암호화 저장, 응답에는 마스킹 표시 |
 
@@ -30,6 +33,10 @@ GitHub Copilot 에이전트와 함께 개발했으며, 요구사항·설계 결�
 | [desktop_agent/retrieval.py](desktop_agent/retrieval.py) | 로컬 코드 검색 |
 | [desktop_agent/residency.py](desktop_agent/residency.py) | 동적 가중치 재배치 제어 |
 | [desktop_agent/benchmark_placement.py](desktop_agent/benchmark_placement.py), [benchmark_resources.py](desktop_agent/benchmark_resources.py) | GPU 배치 벤치마크·자원 감시 |
+| [desktop_agent/kaggle_server.py](desktop_agent/kaggle_server.py) | Kaggle T4×2 추론 서버 운영 모듈(빌드·패치·기동·인증·터널, 표준 라이브러리만 사용) |
+| [desktop_agent/kaggle_link.py](desktop_agent/kaggle_link.py) | PC 쪽 원격 엔진 연결·검증·키 저장 |
+| [desktop_agent/benchmark_kaggle_mtp.py](desktop_agent/benchmark_kaggle_mtp.py), [benchmark_automation.py](desktop_agent/benchmark_automation.py) | MTP 초안 길이 비교, 반복·병렬 도구 벤치마크 |
+| [desktop_agent/KAGGLE-T4-ENGINE.md](desktop_agent/KAGGLE-T4-ENGINE.md) | T4×2 추론 엔진 최적화 연구 기록 |
 | [desktop_agent/credentials.py](desktop_agent/credentials.py) | DPAPI 기반 키 저장 |
 | [desktop_agent/README.md](desktop_agent/README.md) | 기능별 상세 변경 기록 |
 | [desktop_agent/TOOL-CONTRACT.md](desktop_agent/TOOL-CONTRACT.md) | 도구 입력 형식·한도·중단 정책 |
@@ -50,16 +57,23 @@ python -m desktop_agent.app
 
 로컬 모델을 쓰려면 llama.cpp `llama-server` 실행 파일과 GGUF 모델 경로를 설정 화면에서 지정해야 합니다.
 
+Kaggle 원격 엔진은 노트북에서 서버를 시작한 뒤 PC에서 연결합니다. 서버 구성과 성능 연구는 [t4-llm-serving](https://github.com/hanbyungjung-source/t4-llm-serving)에 정리했습니다.
+
+```powershell
+python -m desktop_agent.kaggle_link --connect
+```
+
 ## 테스트
 
 ```powershell
-python -m unittest tests.test_desktop_agent tests.test_desktop_api
+python -m unittest tests.test_desktop_agent tests.test_desktop_api tests.test_desktop_kaggle
 ```
 
-일부 테스트는 원 개발 환경의 런타임 배포 파일(`desktop_agent/data/`)을 전제로 하므로 이 저장소만으로는 건너뛰거나 실패할 수 있습니다.
+원 개발 환경에서는 359개 중 331개 통과, 28개 건너뜀입니다(2026-10-07). 일부 테스트는 원 개발 환경의 런타임 배포 파일(`desktop_agent/data/`)을 전제로 하므로 이 저장소만으로는 건너뛰거나 실패할 수 있습니다.
 
 ## 한계
 
+- 화면 캡처·입력 제어·`llama-server` 실행을 맡는 공용 모듈(`game_agent`)은 별도 비공개 프로젝트의 일부라 포함하지 않았습니다. 이 저장소만으로는 앱 실행과 이 모듈을 쓰는 테스트가 동작하지 않으며, 코드 열람용입니다. `kaggle_server.py`는 단독으로 동작합니다.
 - PowerShell 도구의 작업 폴더는 샌드박스가 아니며, 관리자 권한·대화형 입력은 지원하지 않습니다.
 - 검색 도구는 CAPTCHA·로그인 화면을 우회하지 않습니다.
 - 코드 검색은 임베딩 의미 검색이나 언어 서버 수준의 참조 해석이 아닙니다.

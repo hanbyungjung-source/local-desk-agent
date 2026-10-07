@@ -172,6 +172,9 @@ def performance_text(metrics):
     effort = metrics.get('reasoning_effort')
     if effort in ('none','low','medium','xhigh'):
         lines.append('reasoning_effort: '+effort)
+    budget = metrics.get('reasoning_budget_tokens')
+    if type(budget) is int:
+        lines.append('reasoning_budget_tokens: '+str(budget))
     context,limit = metrics.get('context_tokens'),metrics.get('context_limit')
     if measured(context) and measured(limit) and limit > 0:
         source = '\uc11c\ubc84 \ubcf4\uace0' if metrics.get('context_source') == 'server_usage' else '\ucd94\uc815'
@@ -312,6 +315,7 @@ class Console(TkinterDnD.Tk):
         self.refresh_windows()
         self.monitor = InputMonitor(lambda reason:self.events.put(('interrupt',reason)))
         self.monitor.stop_on_input = False
+        self.monitor.stop_on_escape = False
         self.update_backend_display()
         self.worker = threading.Thread(target=self.work,daemon=True)
         self.worker.start()
@@ -356,6 +360,8 @@ class Console(TkinterDnD.Tk):
         self.reason_selector = ttk.Combobox(self.header,textvariable=self.reason_level,values=self.settings.reasoning_levels,width=9,state='readonly')
         self.reason_selector.pack(side='right',padx=4)
         self.reason_selector.bind('<<ComboboxSelected>>',self.reasoning_level_changed)
+        self.reason_budget_button = self.icon(self.header,'\u23f1','Reasoning token budget',self.reasoning_budget_dialog)
+        self.reason_budget_button.pack(side='right')
         self.body = ttk.Panedwindow(self,orient='horizontal')
         self.body.pack(fill='both',expand=True,padx=10)
         sidebar = ttk.Frame(self.body,padding=8,width=195)
@@ -432,6 +438,9 @@ class Console(TkinterDnD.Tk):
         compact_control.pack(side='left')
         self.permissions.append(compact_control)
         self.icon(compact_row,'\u2261','\ubcf4\uad00\ub41c \ub300\ud654 \uc694\uc57d',self.show_context_summary).pack(side='right')
+        compact_settings=self.icon(compact_row,'\u2699','\uc790\ub3d9 \uc694\uc57d \uae30\uc900',self.compaction_settings_dialog)
+        compact_settings.pack(side='right')
+        self.permissions.append(compact_settings)
         row = ttk.Frame(right)
         row.pack(fill='x',pady=(8,2))
         ttk.Label(row,text='Target window').pack(side='left')
@@ -697,6 +706,55 @@ class Console(TkinterDnD.Tk):
         self.settings.save(self.data/'settings.json')
         self.model.settings=self.settings
 
+    def compaction_settings_dialog(self):
+        if self.busy:
+            return
+        dialog=tk.Toplevel(self)
+        dialog.title('\uc790\ub3d9 \uc694\uc57d \uae30\uc900')
+        dialog.minsize(420,220)
+        place_dialog(dialog,self,460,240)
+        actions=ttk.Frame(dialog,padding=10)
+        actions.pack(side='bottom',fill='x')
+        body=ttk.Frame(dialog,padding=12)
+        body.pack(fill='both',expand=True)
+        body.columnconfigure(1,weight=1)
+        trigger=tk.StringVar(master=dialog,value=str(self.settings.compaction_trigger_percent))
+        target=tk.StringVar(master=dialog,value=str(self.settings.compaction_target_percent))
+        error=tk.StringVar(master=dialog)
+        for row,(label,variable,minimum,maximum,name) in enumerate((
+                ('\uc694\uc57d \uc2dc\uc791 (%)',trigger,2,100,'trigger'),
+                ('\uc815\ub9ac \ud6c4 \ubaa9\ud45c (%)',target,1,99,'target'))):
+            ttk.Label(body,text=label).grid(row=row,column=0,sticky='w',padx=(0,12),pady=8)
+            ttk.Spinbox(body,name=name,textvariable=variable,from_=minimum,to=maximum,increment=1,width=8).grid(row=row,column=1,sticky='ew',pady=8)
+        ttk.Label(body,textvariable=error,wraplength=390).grid(row=2,column=0,columnspan=2,sticky='w',pady=4)
+        def defaults():
+            trigger.set('85');target.set('65');error.set('')
+        def save():
+            if self.busy:
+                return
+            try:
+                settings=replace(self.settings,compaction_trigger_percent=int(trigger.get()),compaction_target_percent=int(target.get()))
+                settings.validate_compaction()
+            except (ValueError,tk.TclError):
+                error.set('\ubaa9\ud45c\ub294 1% \uc774\uc0c1, \uc2dc\uc791\ubcf4\ub2e4 \uc791\uc544\uc57c \ud558\uba70 \uc2dc\uc791\uc740 100% \uc774\ud558\uc758 \uc815\uc218\uc5ec\uc57c \ud569\ub2c8\ub2e4.')
+                return
+            try:
+                settings.save(self.data/'settings.json')
+            except OSError as failure:
+                error.set(str(failure))
+                return
+            self.settings=settings
+            self.model.settings=settings
+            self.status.set('\uc790\ub3d9 \uc694\uc57d \uae30\uc900 \uc800\uc7a5: '+str(settings.compaction_trigger_percent)+'% / '+str(settings.compaction_target_percent)+'%')
+            dialog.destroy()
+        ttk.Button(actions,name='defaults',text='\uae30\ubcf8\uac12',command=defaults).pack(side='left')
+        ttk.Button(actions,name='save',text='\uc800\uc7a5',command=save).pack(side='right')
+        ttk.Button(actions,name='cancel',text='\ucde8\uc18c',command=dialog.destroy).pack(side='right',padx=6)
+        dialog.bind('<Return>',lambda event:save())
+        dialog.bind('<Escape>',lambda event:dialog.destroy())
+        dialog.grab_set()
+        return dialog
+
     def show_context_summary(self):
         from desktop_agent.compaction import restore_summary
         saved=restore_summary(self.store,self.identifier,self.store.events(self.identifier))
@@ -723,6 +781,49 @@ class Console(TkinterDnD.Tk):
                 return
         self.settings = replace(self.settings,capture_margin=margin)
         self.settings.save(self.data/'settings.json')
+
+    def reasoning_budget_dialog(self):
+        if self.busy or self.settings.backend != 'local' or not self.settings.uses_reasoning_effort:
+            return
+        dialog=tk.Toplevel(self)
+        dialog.title('\uc0ac\uace0 \ud1a0\ud070 \uc608\uc0b0')
+        dialog.minsize(440,200)
+        place_dialog(dialog,self,480,220)
+        actions=ttk.Frame(dialog,padding=10)
+        actions.pack(side='bottom',fill='x')
+        body=ttk.Frame(dialog,padding=12)
+        body.pack(fill='both',expand=True)
+        body.columnconfigure(1,weight=1)
+        budget=tk.StringVar(master=dialog,value=str(self.settings.reasoning_budget_tokens))
+        error=tk.StringVar(master=dialog)
+        ttk.Label(body,text='\uc0ac\uace0 \ud1a0\ud070 (-1: \ubb34\uc81c\ud55c, 0: \uc989\uc2dc \ub2f5\ubcc0)').grid(row=0,column=0,sticky='w',padx=(0,12),pady=8)
+        ttk.Spinbox(body,name='budget',textvariable=budget,from_=-1,to=65536,increment=1,width=8).grid(row=0,column=1,sticky='ew',pady=8)
+        ttk.Label(body,textvariable=error,wraplength=405).grid(row=1,column=0,columnspan=2,sticky='w',pady=4)
+        def save():
+            if self.busy:
+                return
+            try:
+                settings=replace(self.settings,reasoning_budget_tokens=int(budget.get()))
+                settings.validate_reasoning_budget()
+            except (ValueError,tk.TclError):
+                error.set('\uc0ac\uace0 \uc608\uc0b0\uc740 -1\ubd80\ud130 65536\uae4c\uc9c0\uc758 \uc815\uc218\uc5ec\uc57c \ud569\ub2c8\ub2e4.')
+                return
+            try:
+                settings.save(self.data/'settings.json')
+            except OSError as failure:
+                error.set(str(failure))
+                return
+            self.settings=settings
+            self.enqueue('reasoning',settings)
+            self.status.set('\uc0ac\uace0 \ud1a0\ud070 \uc608\uc0b0 \uc800\uc7a5: '+str(settings.reasoning_budget_tokens))
+            dialog.destroy()
+        ttk.Button(actions,name='defaults',text='\uae30\ubcf8\uac12',command=lambda:budget.set('2048')).pack(side='left')
+        ttk.Button(actions,name='save',text='\uc800\uc7a5',command=save).pack(side='right')
+        ttk.Button(actions,name='cancel',text='\ucde8\uc18c',command=dialog.destroy).pack(side='right',padx=6)
+        dialog.bind('<Return>',lambda event:save())
+        dialog.bind('<Escape>',lambda event:dialog.destroy())
+        dialog.grab_set()
+        return dialog
 
     def reasoning_changed(self):
         if self.settings.backend == 'api':
@@ -791,6 +892,7 @@ class Console(TkinterDnD.Tk):
         self.title('Local Desk | '+(self.settings.api.model+' [API]' if remote else self.settings.local_label))
         self.think_button.configure(state='disabled' if remote or self.busy else 'normal')
         self.reason_selector.configure(state='disabled' if remote or self.busy else 'readonly')
+        self.reason_budget_button.configure(state='disabled' if remote or self.busy or not self.settings.uses_reasoning_effort else 'normal')
         self.api_button.configure(style='Accent.TButton' if remote else 'TButton')
 
     def confirm_api_transfer(self):
@@ -1309,7 +1411,7 @@ class Console(TkinterDnD.Tk):
                         return
                 if settings.kv_cache_type!=self.settings.kv_cache_type and settings.kv_cache_type in ('q4_0','f16'):
                     if not messagebox.askyesno('KV cache',
-                            'Q4 may reduce quality; F16 increases VRAM use. Q2 dynamic residency is available only with Q8. Apply and unload?',parent=dialog):
+                            'Q4 may reduce quality; F16 increases VRAM use. Q2 dynamic residency plans for the selected context/KV/cache profile and stops if memory limits are exceeded. Apply and unload?',parent=dialog):
                         return
                 settings.save(self.data/'settings.json')
                 self.settings = settings
@@ -1377,7 +1479,8 @@ class Console(TkinterDnD.Tk):
         tree.pack(fill='both',expand=True)
         membership = {name:group for group,(_,names) in TOOL_GROUPS.items() for name in names}
         group_labels = {'base':'\uae30\ubcf8','browser':'\ube0c\ub77c\uc6b0\uc800','recording':'\ub179\ud654\u00b7\uc791\uc5c5',
-                        'advanced_input':'\uace0\uae09 \uc785\ub825','files':'\ucca8\ubd80\u00b7\uae30\ub85d','workspace':'\uc791\uc5c5 \ud3f4\ub354','terminal':'PowerShell'}
+                        'advanced_input':'\uace0\uae09 \uc785\ub825','files':'\ucca8\ubd80\u00b7\uae30\ub85d','workspace':'\uc791\uc5c5 \ud3f4\ub354','terminal':'PowerShell',
+                        'automation':'\ubc18\ubcf5\u00b7\ubcd1\ub82c'}
         def render():
             selection = tree.selection()
             tree.delete(*tree.get_children())
@@ -1621,6 +1724,7 @@ class Console(TkinterDnD.Tk):
         for widget in (self.entry,self.send_button,self.load_button,self.unload_button,self.api_button,self.think_button,self.attach_button,self.delete_session_button,self.tool_picker_button,*self.permissions):
             widget.configure(state='disabled' if value else 'normal')
         self.reason_selector.configure(state='disabled' if value else 'readonly')
+        self.reason_budget_button.configure(state='disabled' if value or self.settings.backend == 'api' or not self.settings.uses_reasoning_effort else 'normal')
         self.image_selector.configure(state='disabled' if value else 'readonly')
         self.margin_selector.configure(state='disabled' if value else 'readonly')
         self.window_selector.configure(state='disabled' if value else 'readonly')
@@ -2204,6 +2308,8 @@ class Console(TkinterDnD.Tk):
                     if self.live_reasoning and isinstance(value,str):
                         self.live_reasoning['text'] = value
                         reasoning_dirty = True
+            elif kind == 'tool_progress':
+                self.status.set(f"{value['tool']}: {value['completed']}/{value['total']}")
             elif kind == 'context':
                 prefix = 'API est. ' if self.settings.backend == 'api' else ''
                 self.context_status.set(f'{prefix}~{value["tokens"]}/{self.settings.context_limit//1024}K | omitted {value["omitted"]}')

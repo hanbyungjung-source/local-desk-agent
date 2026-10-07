@@ -9,6 +9,538 @@ from desktop_agent.protocol import action_schema, approval_reason, validate_acti
 
 
 class PolicyTests(unittest.TestCase):
+    def test_front_profile_deployment_checks_caps_devices_and_identity(self):
+        from unittest.mock import patch
+        from desktop_agent import models,residency
+        adapters=[dict(software=False,vendor=0x10de,device=0x2d83,luid='rtx-now'),
+                  dict(software=False,vendor=0x1002,device=0x6fdf,luid='rx-now')]
+        with tempfile.TemporaryDirectory() as folder:
+            runtime=Path(folder)/'runtime';runtime.mkdir()
+            model=Path(folder)/models.Q2_XL['model'];projector=Path(folder)/models.Q2_XL['projector']
+            for path in (model,projector,runtime/'llama-server.exe'):
+                path.write_bytes(b'fixture')
+            record=dict(schema=2,baseline_id='front_native_profiles_v1',profile_planning='runtime_signature',
+                        files={'llama-server.exe':residency.sha256(runtime/'llama-server.exe')},
+                        environment={'LOCAL_DESK_RESIDENCY_MODE':'mixed_fill'},
+                        caps=dict(rtx_dedicated=7850*1024**2,rtx_shared=190*1024**2,available_ram=4*1024**3,headroom=32*1024**2))
+            for name,path in (('model',model),('projector',projector)):
+                record[name]=dict(path=str(path),size=path.stat().st_size,mtime_ns=path.stat().st_mtime_ns)
+            manifest=runtime/'deployment.json';manifest.write_text(json.dumps(record))
+            profile=residency.front_profile(24576,'q4_0',2048)
+            with patch.object(models,'Q2_PROFILE_RUNTIME',runtime),patch.object(residency,'gpu_adapters',return_value=adapters), \
+                 patch.dict(os.environ,{'LOCAL_DESK_FRONT_EXPORT':'1','LOCAL_DESK_FRONT_TABLE':'old','GGML_CUDA_DISABLE_GRAPHS':'1'}):
+                original=dict(os.environ)
+                verified,environment=residency.deployment(str(model),str(projector),profile=profile)
+                self.assertEqual(environment['LOCAL_DESK_FRONT_ID'],profile['identity'])
+                self.assertEqual(environment['LOCAL_DESK_RTX_LUID'],'rtx-now')
+                self.assertEqual(verified['rx_luid'],'rx-now')
+                self.assertEqual(verified['caps']['rtx_shared'],190*1024**2)
+                for key in ('LOCAL_DESK_FRONT_EXPORT','LOCAL_DESK_FRONT_TABLE','GGML_CUDA_DISABLE_GRAPHS'):
+                    self.assertNotIn(key,environment)
+                self.assertEqual(dict(os.environ),original)
+                with self.assertRaisesRegex(ValueError,'identity'):
+                    residency.deployment(str(model),str(projector),profile=dict(profile,identity='bad'))
+                record['caps']['rtx_shared']+=1;manifest.write_text(json.dumps(record))
+                with self.assertRaisesRegex(ValueError,'caps'):
+                    residency.deployment(str(model),str(projector),profile=profile)
+                record['caps']['rtx_shared']-=1;manifest.write_text(json.dumps(record))
+                (runtime/'llama-server.exe').write_bytes(b'changed')
+                with self.assertRaisesRegex(ValueError,'file mismatch'):
+                    residency.deployment(str(model),str(projector),profile=profile)
+        for rows in (adapters[:1],adapters+[adapters[0]],adapters+[dict(adapters[0],device=123)]):
+            with self.assertRaisesRegex(ValueError,'RTX5050'):
+                residency.profile_adapters(rows)
+
+    def test_front_profile_runtime_selection_preserves_all_options(self):
+        from desktop_agent.agent import DesktopServer
+        from desktop_agent.models import Q2_XL,Q2_PROFILE_RUNTIME
+        server=DesktopServer()
+        for context in range(4096,65537,1024):
+            for cache in (0,2048):
+                for kind in ('default','q4_0','q8_0','f16'):
+                    server.context_tokens=context;server.cache_ram_mib=cache;server.kv_cache_type=kind
+                    self.assertTrue(server.front_enabled(Q2_XL['model'],Q2_XL['projector']))
+                    selected=server.settings_for('fixture.exe',Q2_XL['model'],Q2_XL['projector'],1024,1024)
+                    self.assertEqual(selected[0],str(Q2_PROFILE_RUNTIME/'llama-server.exe'))
+                    options=selected[-1]
+                    for flag,value in (('-c',str(context)),('-ctk','q8_0' if kind=='default' else kind),
+                                       ('-ctv','q8_0' if kind=='default' else kind),('--cache-ram',str(cache)),
+                                       ('-ub','128'),('-b','512'),('--spec-type','none')):
+                        self.assertEqual(options.count(flag),1)
+                        self.assertEqual(options[options.index(flag)+1],value)
+        self.assertIsNone(server.process)
+
+    def test_front_profile_approved_shared190_keeps_other_limits(self):
+        from desktop_agent.residency import memory_reason
+        record=dict(rtx_luid='rtx',rx_luid='rx',caps=dict(rtx_dedicated=7850*1024**2,rtx_shared=190*1024**2,available_ram=4*1024**3))
+        row=dict(adapter_dedicated={'rtx':7000*1024**2,'rx':4000*1024**2},process_shared={'pid_123_rtx':186*1024**2})
+        self.assertEqual(memory_reason(row,8*1024**3,123,record,True),'')
+        row['process_shared']['pid_123_rtx']=190*1024**2+1
+        self.assertIn('shared',memory_reason(row,8*1024**3,123,record,True))
+        row['process_shared']['pid_123_rtx']=186*1024**2
+        self.assertIn('RAM',memory_reason(row,4*1024**3-1,123,record,True))
+        row['adapter_dedicated']['rtx']=7850*1024**2+1
+        self.assertIn('dedicated',memory_reason(row,8*1024**3,123,record,True))
+
+    def test_front_start_preserves_memory_guard_reason_after_loader_cleanup(self):
+        import threading
+        from unittest.mock import Mock,patch
+        from desktop_agent.agent import DesktopServer
+        from desktop_agent.models import Q2_XL
+        from game_agent.core import Halted
+        server=DesktopServer();server.context_tokens=24576;server.kv_cache_type='q4_0'
+        guard=Mock(reason='Front residency: RTX shared GPU memory limit exceeded')
+        def load(*args,**kwargs):
+            server.close()
+            raise Halted('Model loading cancelled or timed out')
+        with patch('desktop_agent.residency.deployment',return_value=({},{})),patch('desktop_agent.residency.ResidencyGuard',return_value=guard),patch('game_agent.runtime.LocalServer.start',side_effect=load):
+            with self.assertRaisesRegex(RuntimeError,'RTX shared GPU memory limit exceeded'):
+                server.start('fixture.exe',Q2_XL['model'],Q2_XL['projector'],Path('fixture.log'),threading.Event(),1024,1024)
+        self.assertIsNone(server.residency_guard)
+
+    def test_front_profile_covers_selectable_combinations_without_aliasing(self):
+        from desktop_agent.residency import front_profile
+        profiles={}
+        for context in range(4096,65537,1024):
+            for cache in (0,2048):
+                for kind in ('default','q4_0','q8_0','f16'):
+                    profile=front_profile(context,kind,cache)
+                    key=(context,'q8_0' if kind=='default' else kind,cache)
+                    self.assertEqual(profile['n_ubatch'],128)
+                    if key in profiles:
+                        self.assertEqual(profile,profiles[key])
+                    profiles[key]=profile
+        self.assertEqual(len(profiles),366)
+        self.assertEqual(len({profile['identity'] for profile in profiles.values()}),366)
+        for context,kind,cache in ((True,'q8_0',0),(8193,'q8_0',0),(8192,'q2',0),(8192,'q8_0',True),(8192,'q8_0',4096)):
+            with self.assertRaises(ValueError):
+                front_profile(context,kind,cache)
+
+    def test_compaction_unreachable_target_reports_limit_without_repeating(self):
+        import threading
+        from unittest.mock import Mock
+        from desktop_agent.agent import Settings,pack_messages
+        from desktop_agent.compaction import Compactor
+        from desktop_agent.protocol import normalize_call
+        with tempfile.TemporaryDirectory() as folder:
+            store=Store(folder);identifier=store.create()
+            request=store.append(identifier,'user','Current user request must remain.')
+            for index in range(18):
+                action=normalize_call(dict(tool='finish',arguments={'text':('finding '+str(index)+' ')*120}))
+                store.append(identifier,'assistant',json.dumps(action))
+            events=store.events(identifier)
+            model=Mock();model.settings=Settings(context_tokens=32768,compaction_target_percent=10)
+            model.count=lambda text:len(text)//4;model.tool_names=('finish',)
+            model.generate.return_value=(normalize_call(dict(tool='finish',arguments={'text':'Earlier findings retained. Keep the current request and recent findings.'})),{})
+            notify=Mock();manager=Compactor(store,model,threading.Event(),notify)
+            _,_,tokens=pack_messages(events,'guide',model.count,float('inf'))
+            budget=tokens*100//90
+            visible,memory,covered=manager.prepare(identifier,events,'guide',budget,{},request)
+            self.assertTrue(covered)
+            protected={request,*[event['id'] for event in events[-6:]]}
+            self.assertFalse(protected & covered)
+            self.assertTrue(protected <= {event['id'] for event in visible})
+            policy=store.context_summary(identifier)['compaction']
+            self.assertFalse(policy['target_met'])
+            self.assertGreater(policy['retained_tokens'],policy['target_tokens'])
+            self.assertLessEqual(policy['retained_tokens'],budget)
+            self.assertTrue(manager.target_limited)
+            self.assertEqual(manager.attempts,1)
+            manager.prepare(identifier,store.events(identifier),'guide',budget,{},request)
+            model.generate.assert_called_once()
+            self.assertTrue(any('target not reached' in str(call) for call in notify.call_args_list))
+            self.assertEqual(store.events(identifier)[:len(events)],events)
+
+    def test_compaction_settings_dialog_saves_validates_cancels_and_fits(self):
+        import tkinter as tk
+        from types import SimpleNamespace
+        from desktop_agent.agent import Settings
+        from desktop_agent.app import Console
+        def widgets(dialog):
+            pending=list(dialog.winfo_children());found={}
+            while pending:
+                widget=pending.pop()
+                found[widget.winfo_name()]=widget
+                pending.extend(widget.winfo_children())
+            return found
+        def enter(widget,value):
+            widget.delete(0,'end');widget.insert(0,value)
+        root=tk.Tk()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                root.geometry('480x300+50+50')
+                root.busy=False;root.settings=Settings();root.data=Path(folder)
+                root.model=SimpleNamespace(settings=root.settings)
+                root.status=tk.StringVar(master=root)
+                root.update()
+                dialog=Console.compaction_settings_dialog(root)
+                dialog.geometry('420x220');root.update()
+                controls=widgets(dialog)
+                self.assertEqual(controls['trigger'].get(),'85')
+                self.assertEqual(controls['target'].get(),'65')
+                enter(controls['target'],'85');controls['save'].invoke();root.update()
+                self.assertTrue(dialog.winfo_exists())
+                self.assertFalse((root.data/'settings.json').exists())
+                for name in ('trigger','target','save','cancel','defaults'):
+                    control=controls[name]
+                    self.assertTrue(control.winfo_ismapped())
+                    self.assertLessEqual(control.winfo_rooty()+control.winfo_height(),dialog.winfo_rooty()+dialog.winfo_height())
+                enter(controls['trigger'],'90');enter(controls['target'],'55')
+                controls['save'].invoke();root.update()
+                self.assertFalse(dialog.winfo_exists())
+                saved=Settings.load(root.data/'settings.json')
+                self.assertEqual((saved.compaction_trigger_percent,saved.compaction_target_percent),(90,55))
+                self.assertIs(root.model.settings,root.settings)
+                before=(root.data/'settings.json').read_bytes()
+                dialog=Console.compaction_settings_dialog(root);root.update()
+                controls=widgets(dialog);controls['defaults'].invoke()
+                self.assertEqual((controls['trigger'].get(),controls['target'].get()),('85','65'))
+                controls['cancel'].invoke();root.update()
+                self.assertEqual((root.data/'settings.json').read_bytes(),before)
+                self.assertEqual(root.settings.compaction_trigger_percent,90)
+                root.busy=True
+                self.assertIsNone(Console.compaction_settings_dialog(root))
+        finally:
+            root.destroy()
+
+    def test_compaction_target_reaches_headroom_and_keeps_protected_call_groups(self):
+        import threading
+        from unittest.mock import Mock
+        from desktop_agent.agent import Settings,pack_messages
+        from desktop_agent.compaction import Compactor
+        from desktop_agent.protocol import normalize_call
+        with tempfile.TemporaryDirectory() as folder:
+            store=Store(folder);identifier=store.create()
+            request=store.append(identifier,'user','Preserve the current request and pending work.')
+            groups=[]
+            for index in range(15):
+                call=normalize_call(dict(tool='browser_read',arguments={}))
+                call_id='fixture-'+str(index)
+                first=store.append(identifier,'assistant',json.dumps(call),call_id=call_id)
+                last=store.append(identifier,'tool',('older observation '*100 if index<12 else 'recent result'),tool='browser_read',status='delivered',call_id=call_id)
+                groups.append({first,last})
+            events=store.events(identifier)
+            model=Mock();model.settings=Settings(context_tokens=32768,compaction_trigger_percent=95)
+            model.count=lambda text:len(text)//4;model.tool_names=('finish','browser_read')
+            state={'pending_jobs':[{'call_id':'fixture-1'}]}
+            _,_,before=pack_messages(events,'guide',model.count,float('inf'),state=state)
+            budget=before*100//90
+            manager=Compactor(store,model,threading.Event(),Mock())
+            manager.prepare(identifier,events,'guide',budget,state,request)
+            model.generate.assert_not_called()
+            model.settings.compaction_trigger_percent=85
+            model.generate.return_value=(normalize_call(dict(tool='finish',arguments={'text':'Older observations were recorded. Keep the current goal and pending call.'})),{})
+            visible,memory,covered=manager.prepare(identifier,events,'guide',budget,state,request)
+            self.assertTrue(covered)
+            self.assertNotIn(request,covered)
+            for group in groups:
+                self.assertIn(len(group & covered),(0,len(group)))
+            self.assertFalse(groups[1] & covered)
+            self.assertFalse(set(event['id'] for event in events[-6:]) & covered)
+            policy=store.context_summary(identifier)['compaction']
+            self.assertTrue(policy['target_met'],policy)
+            self.assertLessEqual(policy['retained_tokens'],budget*65//100)
+            self.assertFalse(manager.target_limited)
+            added=store.append(identifier,'tool','small new result',tool='browser_read',status='delivered')
+            manager.prepare(identifier,store.events(identifier),'guide',budget,state,request)
+            self.assertEqual(model.generate.call_count,1)
+            self.assertEqual(store.events(identifier)[:len(events)],events)
+            self.assertGreater(added,max(covered))
+
+    def test_compaction_percentages_defaults_roundtrip_and_validation(self):
+        from dataclasses import replace
+        from desktop_agent.agent import Settings
+        defaults=Settings()
+        self.assertEqual((defaults.compaction_trigger_percent,defaults.compaction_target_percent),(85,65))
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'settings.json'
+            path.write_text('{}',encoding='utf-8')
+            self.assertEqual(Settings.load(path).compaction_target_percent,65)
+            custom=replace(defaults,compaction_trigger_percent=90,compaction_target_percent=55)
+            custom.save(path)
+            restored=Settings.load(path)
+            self.assertEqual((restored.compaction_trigger_percent,restored.compaction_target_percent),(90,55))
+            for trigger,target in ((65,65),(60,70),(101,65),(85,0),(True,1),(85,65.0)):
+                invalid=replace(defaults,compaction_trigger_percent=trigger,compaction_target_percent=target)
+                with self.subTest(trigger=trigger,target=target),self.assertRaises(ValueError):
+                    invalid.validate_compaction()
+
+    def test_cache_trace_stream_payload_parity_and_failure_reset(self):
+        from copy import deepcopy
+        import threading
+        from unittest.mock import MagicMock,Mock,patch
+        from PIL import Image
+        from desktop_agent.agent import Model,Settings
+        reply=dict(tool='finish',arguments={'text':'Done'})
+        events=[dict(choices=[dict(delta={'content':json.dumps(reply)},finish_reason='stop')],
+                     timings={'cache_n':42,'prompt_n':12},usage={'prompt_tokens':54,'completion_tokens':7})]
+        response=MagicMock()
+        response.__enter__.return_value=response
+        response.iter_lines.return_value=['data: '+json.dumps(event) for event in events]+['data: [DONE]']
+        client=MagicMock()
+        client.__enter__.return_value=client
+        client.post.return_value=response
+        model=Model(Settings())
+        model.endpoint='http://127.0.0.1:1234'
+        messages=[dict(role='system',content='Fixture guide'),dict(role='user',content='Fixture request',_event_id=101),
+                  dict(role='user',content='Fixture state',_status=True)]
+        original=deepcopy(messages)
+        image=Image.new('RGB',(8,8),'white')
+        stopped=threading.Event()
+        try:
+            with patch('desktop_agent.agent.session',return_value=client):
+                with patch('desktop_agent.agent.request_cache_trace',return_value=(None,{})):
+                    model.generate(messages,image,stopped,Mock())
+                baseline=deepcopy(client.post.call_args.kwargs)
+                _,first=model.generate(messages,image,stopped,Mock())
+                self.assertEqual(client.post.call_args.kwargs,baseline)
+                self.assertFalse(first['cache_transition']['previous_request_available'])
+                _,second=model.generate(messages,image,stopped,Mock())
+                self.assertEqual(client.post.call_args.kwargs,baseline)
+                self.assertEqual(second['cache_transition']['common_prefix_messages'],4)
+                self.assertTrue(second['cache_transition']['same_image_messages'])
+                self.assertEqual(second['prompt_cache']['reported_cached_tokens'],42)
+                self.assertEqual(second['timings'],events[0]['timings'])
+                self.assertNotIn('Fixture',json.dumps(second['cache_transition']))
+                changed=deepcopy(messages)
+                changed[1]['content']='Edited request'
+                _,edited=model.generate(changed,image,stopped,Mock())
+                self.assertEqual(edited['cache_transition']['common_prefix_messages'],1)
+                self.assertEqual(edited['cache_transition']['first_changed_current']['event_id'],101)
+                client.post.side_effect=RuntimeError('Fixture transport error')
+                with self.assertRaisesRegex(RuntimeError,'Fixture transport error'):
+                    model.generate(messages,image,stopped,Mock())
+                self.assertIsNone(model._cache_request)
+                client.post.side_effect=None
+                _,recovered=model.generate(messages,image,stopped,Mock())
+                self.assertFalse(recovered['cache_transition']['previous_request_available'])
+            self.assertEqual(messages,original)
+        finally:
+            model.close()
+        self.assertIsNone(model._cache_request)
+
+    def test_cache_trace_finds_history_state_and_summary_boundaries_without_content(self):
+        from copy import deepcopy
+        from desktop_agent.agent import request_cache_trace
+        messages=[dict(role='system',content='private fixed guide'),dict(role='user',content='private request'),
+                  dict(role='user',content='private state'),dict(role='user',content=[dict(type='image_url',image_url={'url':'data:image/jpeg;base64,private-image'})])]
+        origins=[{},dict(_event_id=1),dict(_status=True)]
+        payload=dict(messages=messages,temperature=0,max_tokens=-1)
+        original=deepcopy(payload)
+        before,first=request_cache_trace(payload,origins,scope='server-one')
+        self.assertFalse(first['previous_request_available'])
+        self.assertEqual(original,payload)
+        changed=deepcopy(payload)
+        changed['messages'].insert(2,dict(role='assistant',content='private action'))
+        current,trace=request_cache_trace(changed,[{},dict(_event_id=1),dict(_event_id=2),dict(_status=True)],before,'server-one')
+        self.assertEqual(trace['common_prefix_messages'],2)
+        self.assertEqual(trace['first_changed_previous']['kind'],'state_or_memory')
+        self.assertEqual(trace['first_changed_current']['event_id'],2)
+        self.assertTrue(trace['same_image_messages'])
+        self.assertTrue(trace['same_request_options'])
+        self.assertNotIn('private',json.dumps([before,current,trace]))
+        summary=deepcopy(changed)
+        summary['messages'][0]['content']+='\n\nCONTEXT COMPACTION MODE\nsummary'
+        _,trace=request_cache_trace(summary,[],current,'server-one')
+        self.assertEqual(trace['purpose'],'compaction')
+        self.assertEqual(trace['common_prefix_messages'],0)
+        self.assertEqual(trace['first_changed_current']['kind'],'system')
+        _,trace=request_cache_trace(changed,[],current,'server-two')
+        self.assertFalse(trace['previous_request_available'])
+        self.assertEqual(trace['reset_reason'],'server_changed')
+
+    def test_macro_progress_event_updates_status(self):
+        import queue
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from desktop_agent.app import Console
+        events=queue.Queue()
+        events.put(('tool_progress',dict(tool='desktop_macro',completed=12,total=100)))
+        console=SimpleNamespace(events=events,status=Mock(),approval=None,closing=False,after=Mock(),poll=Mock())
+        Console.poll(console)
+        console.status.set.assert_called_once_with('desktop_macro: 12/100')
+        console.after.assert_called_once_with(60,console.poll)
+
+    def test_macro_background_cancel_interrupts_interval(self):
+        import threading
+        from unittest.mock import patch
+        from desktop_agent.jobs import ToolRunner,StopSignal
+        from desktop_agent.tools import Tools,ToolResult
+        from desktop_agent.protocol import normalize_call
+        waiting=threading.Event()
+        original_wait=StopSignal.wait
+        def wait(signal,seconds):
+            waiting.set()
+            return original_wait(signal,seconds)
+        with tempfile.TemporaryDirectory() as folder:
+            runner=ToolRunner(folder,threading.Event(),lambda *args:True,lambda *args:None)
+            runner.window={'handle':1,'pid':2};runner.call_id='cancel-parent'
+            try:
+                with patch('desktop_agent.tools.windows.window_title',return_value='Fixture'),patch.object(Tools,'desktop',return_value=ToolResult('ok')) as desktop,patch.object(StopSignal,'wait',wait):
+                    started=runner.execute(normalize_call(dict(tool='desktop_macro',arguments=dict(background=True,repeat=100,interval_ms=500,actions=[dict(tool='desktop_key',arguments={'key':'Enter'})]))))
+                    identifier=json.loads(started.text)['job_id']
+                    self.assertTrue(waiting.wait(3))
+                    runner.execute(normalize_call(dict(tool='job_cancel',arguments={'job_id':identifier})))
+                    runner.background[identifier]['future'].result(timeout=3)
+                    result=runner.collect(identifier)
+                self.assertTrue(result.interrupted)
+                self.assertEqual(result.call_id,'cancel-parent')
+                self.assertEqual(json.loads(result.text)['completed_iterations'],1)
+                desktop.assert_called_once()
+            finally:
+                runner.close()
+
+    def test_macro_protocol_rejects_nesting_denial_and_missing_coordinates(self):
+        from desktop_agent.protocol import normalize_call,compact_call,compact_schema,ToolCatalog,require_pixel_coordinates
+        call=dict(tool='desktop_macro',arguments=dict(actions=[dict(tool='desktop_key',arguments={'key':'Enter'})],repeat=100,interval_ms=500))
+        catalog=ToolCatalog(dict(input=True,screen=True,browser=False),'repeat macro')
+        self.assertEqual(compact_call(catalog.normalize(call)),call)
+        self.assertEqual(normalize_call(dict(tool=call['tool'],arguments=dict(call['arguments'],background=True)))['tool'],'job_start')
+        for child in (call,dict(tool='desktop_key',arguments={'key':'Enter','background':True}),dict(tool='terminal_start',arguments={'command':'echo test'})):
+            with self.assertRaises(ValueError):
+                normalize_call(dict(tool='desktop_macro',arguments={'actions':[child]}))
+        denied=ToolCatalog(dict(input=True,tool_policies={'desktop_key':'disabled'}),'repeat')
+        with self.assertRaises(ValueError):
+            denied.normalize(call)
+        missing=normalize_call(dict(tool='desktop_macro',arguments={'actions':[dict(tool='desktop_click',arguments={'x':2,'y':3})]}))
+        with self.assertRaises(ValueError):
+            require_pixel_coordinates(missing)
+        with self.assertRaises(ValueError):
+            normalize_call(dict(tool='desktop_macro',arguments=dict(call['arguments'],repeat=True)))
+        json.dumps(compact_schema(catalog.names()))
+
+    def test_macro_partial_failure_and_input_lane_exclusion(self):
+        import threading
+        from unittest.mock import patch
+        from desktop_agent.jobs import ToolRunner
+        from desktop_agent.tools import Tools,ToolResult
+        from desktop_agent.protocol import normalize_call
+        entered,release=threading.Event(),threading.Event()
+        seen=[]
+        def desktop(worker,name,arguments):
+            seen.append(arguments.get('text') or arguments.get('key'))
+            if len(seen)==1:
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError('Test did not release first input')
+            if arguments.get('key')=='Enter':
+                return ToolResult('partially sent',error='target changed',interrupted='target changed')
+            return ToolResult('ok')
+        macro=normalize_call(dict(tool='desktop_macro',arguments=dict(repeat=100,actions=[
+            dict(tool='desktop_type',arguments={'text':'first'}),dict(tool='desktop_key',arguments={'key':'Enter'})],background=True)))
+        with tempfile.TemporaryDirectory() as folder:
+            runner=ToolRunner(folder,threading.Event(),lambda *args:True,lambda *args:None)
+            runner.window={'handle':1,'pid':2}
+            try:
+                with patch('desktop_agent.tools.windows.window_title',return_value='Fixture'),patch.object(Tools,'desktop',desktop):
+                    started=json.loads(runner.execute(macro).text)
+                    self.assertTrue(entered.wait(3))
+                    future,_=runner.submit(normalize_call(dict(tool='desktop_type',arguments={'text':'other'})))
+                    self.assertFalse(future.done())
+                    release.set()
+                    result=runner.collect(started['job_id'])
+                    future.result(timeout=3)
+                self.assertEqual(seen,['first','Enter','other'])
+                summary=json.loads(result.text)
+                self.assertEqual(summary['completed_actions'],1)
+                self.assertEqual(summary['completed_iterations'],0)
+                self.assertEqual(summary['last_action']['step'],2)
+                self.assertEqual(summary['status'],'stopped')
+            finally:
+                release.set();runner.close()
+
+    def test_browser_macro_keeps_thread_identity_and_child_approval(self):
+        import threading
+        from unittest.mock import patch
+        from desktop_agent.jobs import ToolRunner
+        from desktop_agent.tools import Tools,ToolResult
+        from desktop_agent.protocol import normalize_call
+        executions=[];approvals=[]
+        def browse(worker,name,arguments):
+            executions.append((threading.get_ident(),worker.call_id))
+            return ToolResult('ok')
+        def approve(action,*args):
+            approvals.append(action['tool'])
+            return action['tool']!='browser_type'
+        with tempfile.TemporaryDirectory() as folder:
+            runner=ToolRunner(folder,threading.Event(),approve,lambda *args:None)
+            runner.call_id='browser-parent'
+            try:
+                call=normalize_call(dict(tool='browser_macro',arguments=dict(repeat=2,actions=[dict(tool='browser_key',arguments={'key':'Enter'})])))
+                with patch.object(Tools,'ensure_browser'),patch.object(Tools,'browser_target',return_value={'label':'Fixture'}),patch.object(Tools,'browse',browse):
+                    result=runner.execute(call)
+                    self.assertFalse(result.error)
+                    self.assertEqual(len({record[0] for record in executions}),1)
+                    self.assertNotEqual(executions[0][0],threading.get_ident())
+                    self.assertEqual([record[1] for record in executions],['browser-parent:1:1','browser-parent:2:1'])
+                    runner.tool_policies={'browser_type':'ask'}
+                    blocked=runner.execute(normalize_call(dict(tool='browser_macro',arguments={'actions':[dict(tool='browser_type',arguments={'selector':'input','text':'fixture'})]})))
+                    self.assertTrue(blocked.interrupted)
+                    self.assertEqual(json.loads(blocked.text)['completed_actions'],0)
+                self.assertIn('browser_type',approvals)
+                self.assertEqual(len(executions),2)
+            finally:
+                runner.close()
+
+    def test_macro_order_count_cancellation_and_policy(self):
+        import threading
+        from unittest.mock import patch
+        from desktop_agent.jobs import ToolRunner,StopSignal
+        from desktop_agent.tools import Tools,ToolResult
+        from desktop_agent.protocol import normalize_call
+        call = normalize_call(dict(tool='desktop_macro',arguments=dict(repeat=100,interval_ms=500,actions=[
+            dict(tool='desktop_type',arguments={'text':'fixture'}),
+            dict(tool='desktop_key',arguments={'key':'Enter'}),
+            dict(tool='desktop_key',arguments={'key':'Enter'})])))
+        with tempfile.TemporaryDirectory() as folder:
+            runner=ToolRunner(folder,threading.Event(),lambda *args:True,lambda *args:None)
+            runner.window={'handle':1,'pid':2};runner.call_id='parent'
+            try:
+                with patch('desktop_agent.tools.windows.window_title',return_value='Fixture'), patch.object(Tools,'desktop',return_value=ToolResult('ok')) as execute, patch.object(StopSignal,'wait',return_value=False) as wait:
+                    result=json.loads(runner.execute(call).text)
+                self.assertEqual(result['completed_iterations'],100)
+                self.assertEqual(result['completed_actions'],300)
+                self.assertEqual([item.args[0] for item in execute.call_args_list],['desktop_type','desktop_key','desktop_key']*100)
+                self.assertEqual([item.args for item in wait.call_args_list],[(0.5,)]*99)
+                journal=[json.loads(line) for line in Path(result['log_path']).read_text(encoding='utf-8').splitlines()]
+                self.assertEqual(journal[1]['call_id'],'parent:1:1')
+                self.assertEqual(journal[-2]['call_id'],'parent:100:3')
+                with patch('desktop_agent.tools.windows.window_title',return_value='Fixture'), patch.object(Tools,'desktop',return_value=ToolResult('ok')), patch.object(StopSignal,'wait',return_value=True):
+                    stopped=runner.execute(call)
+                self.assertTrue(stopped.interrupted)
+                self.assertEqual(json.loads(stopped.text)['completed_iterations'],1)
+                runner.tool_policies={'desktop_key':'disabled'}
+                with patch.object(Tools,'desktop') as execute, self.assertRaises(ValueError):
+                    runner.execute(call)
+                execute.assert_not_called()
+            finally:
+                runner.close()
+
+    def test_parallel_reads_overlap_and_preserve_order(self):
+        import threading
+        from unittest.mock import patch
+        from desktop_agent.jobs import ToolRunner
+        from desktop_agent.tools import Tools,ToolResult
+        from desktop_agent.protocol import normalize_call
+        barrier=threading.Barrier(4,timeout=3)
+        def execute(worker,action):
+            barrier.wait()
+            return ToolResult(action['arguments']['path'],call_id=worker.call_id)
+        call=normalize_call(dict(tool='tool_parallel',arguments={'actions':[
+            dict(tool='workspace_read',arguments={'path':str(index)}) for index in range(4)]}))
+        with tempfile.TemporaryDirectory() as folder:
+            runner=ToolRunner(folder,threading.Event(),lambda *args:True,lambda *args:None)
+            runner.tool_policies={'workspace_read':'allow'};runner.call_id='batch'
+            try:
+                with patch.object(Tools,'execute',execute):
+                    result=runner.execute(call)
+                self.assertFalse(result.error,result.text)
+                records=json.loads(result.text)['results']
+                self.assertEqual([record['text'] for record in records],['0','1','2','3'])
+                self.assertEqual([record['call_id'] for record in records],['batch:1','batch:2','batch:3','batch:4'])
+            finally:
+                runner.close()
+
     @unittest.skipUnless(os.environ.get('DESKTOP_AGENT_GUIDE_MODEL_TEST')=='1','Opt-in bounded local 27B guide validation')
     def test_local_27b_guide_decisions_once(self):
         from dataclasses import replace
@@ -745,7 +1277,7 @@ class PolicyTests(unittest.TestCase):
                 for flag in ('-ctk','-ctv'):
                     self.assertEqual(values[-1].count(flag),1)
                     self.assertEqual(values[-1][values[-1].index(flag)+1],'q8_0' if kind=='default' else kind)
-                self.assertEqual(server.front_enabled(settings.model,settings.projector),kind in ('default','q8_0'))
+                self.assertTrue(server.front_enabled(settings.model,settings.projector))
             settings=Settings(kv_cache_type='invalid');settings.save(path)
             with self.assertRaises(ValueError): Settings.load(path)
 
@@ -821,7 +1353,7 @@ class PolicyTests(unittest.TestCase):
         import threading
         from unittest.mock import Mock,patch
         from desktop_agent.agent import DesktopServer,Settings
-        from desktop_agent.models import Q2_XL,Q2_FRONT_RUNTIME
+        from desktop_agent.models import Q2_XL,Q2_PROFILE_RUNTIME
         from desktop_agent.benchmark_placement import PlacementServer
         server=DesktopServer()
         settings=Settings()
@@ -835,7 +1367,7 @@ class PolicyTests(unittest.TestCase):
                  patch('game_agent.runtime.session') as client:
                 client.return_value.__enter__.return_value.get.return_value.status_code=200
                 server.start(settings.executable,Q2_XL['model'],Q2_XL['projector'],Path(folder)/'server.log',threading.Event(),1024,1024)
-                self.assertEqual(popen.call_args.args[0][0],str(Q2_FRONT_RUNTIME/'llama-server.exe'))
+                self.assertEqual(popen.call_args.args[0][0],str(Q2_PROFILE_RUNTIME/'llama-server.exe'))
                 self.assertEqual(popen.call_args.kwargs['env'],dict(TEST_FRONT='1'))
                 self.assertEqual(server.loaded_settings,server.settings_for(settings.executable,Q2_XL['model'],Q2_XL['projector'],1024,1024))
                 server.start(settings.executable,Q2_XL['model'],Q2_XL['projector'],Path(folder)/'server.log',threading.Event(),1024,1024)
@@ -858,8 +1390,9 @@ class PolicyTests(unittest.TestCase):
     def test_q2xl_front_residency_scope_preserves_other_profiles(self):
         from desktop_agent.models import Q2_XL,IQ2_S,uses_front_residency
         self.assertTrue(uses_front_residency(Q2_XL['model'],Q2_XL['projector'],8192,0))
-        for model,projector,context,cache in ((Q2_XL['model'],Q2_XL['projector'],12288,0),
-                (Q2_XL['model'],Q2_XL['projector'],8192,2048),
+        self.assertTrue(uses_front_residency(Q2_XL['model'],Q2_XL['projector'],24576,2048))
+        for model,projector,context,cache in ((Q2_XL['model'],Q2_XL['projector'],12289,0),
+            (Q2_XL['model'],Q2_XL['projector'],8192,4096),
                 (Q2_XL['model'],'mmproj-F16.gguf',8192,0),
                 (IQ2_S['model'],IQ2_S['projector'],8192,0)):
             self.assertFalse(uses_front_residency(model,projector,context,cache))
@@ -4631,6 +5164,7 @@ $global:captured | ConvertTo-Json -Compress
         with tempfile.TemporaryDirectory() as folder:
             for server,split in ((DesktopServer(),'52,3,1,10'),(PlacementServer(baseline),'1,0')):
                 server.context_tokens=12288
+                server.use_front_residency=False
                 process = Mock()
                 process.poll.return_value = None
                 try:
@@ -4696,6 +5230,7 @@ $global:captured | ConvertTo-Json -Compress
                 inherited = dict(os.environ)
                 server = DesktopServer()
                 server.context_tokens=12288
+                server.use_front_residency=False
                 server.start('server',Q2_XL['model'],Q2_XL['projector'],Path(folder)/'log',threading.Event(),1024,1024)
                 self.assertEqual(start.call_args.kwargs['environment']['GGML_BACKEND_PATH'],str(medium))
                 self.assertEqual(start.call_args.kwargs['environment']['CUDA_SCALE_LAUNCH_QUEUES'],'4x')
@@ -4878,6 +5413,68 @@ $global:captured | ConvertTo-Json -Compress
             path.write_text(json.dumps({'reasoning_effort':'high'}),encoding='utf-8')
             with self.assertRaises(ValueError):
                 Settings.load(path)
+
+    def test_reasoning_budget_dialog_and_escape_policy(self):
+        import tkinter as tk
+        from unittest.mock import Mock
+        from desktop_agent.agent import Settings
+        from desktop_agent.app import Console
+        from game_agent.core import interruption_reason, INPUT_TAG
+        for message in (0x100,0x104):
+            self.assertIsNone(interruption_reason(0,message,0x1B,False,False))
+            self.assertEqual(interruption_reason(0,message,0x77,False,False),'Emergency stop (F8)')
+            self.assertIsNotNone(interruption_reason(0,message,0x1B,False))
+            self.assertIsNone(interruption_reason(INPUT_TAG,message,0x77,False,False))
+        root=tk.Tk()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                root.busy=False;root.settings=Settings(reasoning_enabled=True,reasoning_effort='xhigh')
+                root.data=Path(folder);root.status=tk.StringVar(master=root);root.enqueue=Mock()
+                root.update()
+                dialog=Console.reasoning_budget_dialog(root)
+                dialog.geometry('440x200');root.update()
+                controls={child.winfo_name():child for frame in dialog.winfo_children() for child in frame.winfo_children()}
+                self.assertEqual(controls['budget'].get(),'2048')
+                controls['budget'].set('-2');controls['save'].invoke();root.update()
+                self.assertTrue(dialog.winfo_exists())
+                self.assertFalse((root.data/'settings.json').exists())
+                for name in ('budget','save','cancel','defaults'):
+                    control=controls[name]
+                    self.assertTrue(control.winfo_ismapped())
+                    self.assertLessEqual(control.winfo_rooty()+control.winfo_height(),dialog.winfo_rooty()+dialog.winfo_height())
+                    self.assertLessEqual(control.winfo_rootx()+control.winfo_width(),dialog.winfo_rootx()+dialog.winfo_width())
+                controls['budget'].set('1024');controls['save'].invoke();root.update()
+                self.assertFalse(dialog.winfo_exists())
+                saved=Settings.load(root.data/'settings.json')
+                self.assertEqual((saved.reasoning_budget_tokens,saved.reasoning_effort),(1024,'xhigh'))
+                root.enqueue.assert_called_once_with('reasoning',root.settings)
+                before=(root.data/'settings.json').read_bytes()
+                dialog=Console.reasoning_budget_dialog(root);root.update()
+                controls={child.winfo_name():child for frame in dialog.winfo_children() for child in frame.winfo_children()}
+                controls['defaults'].invoke();self.assertEqual(controls['budget'].get(),'2048')
+                controls['cancel'].invoke();root.update()
+                self.assertEqual((root.data/'settings.json').read_bytes(),before)
+                root.busy=True
+                self.assertIsNone(Console.reasoning_budget_dialog(root))
+        finally:
+            root.destroy()
+
+    def test_reasoning_budget_settings_validate_and_preserve_effort(self):
+        from desktop_agent.agent import Settings
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'settings.json'
+            path.write_text(json.dumps({'reasoning_effort':'xhigh','reasoning_enabled':True}),encoding='utf-8')
+            self.assertEqual(Settings.load(path).reasoning_budget_tokens,2048)
+            for budget in (-1,0,1,2048,65536):
+                settings = Settings(reasoning_effort='xhigh',reasoning_enabled=True,reasoning_budget_tokens=budget)
+                settings.save(path)
+                loaded = Settings.load(path)
+                self.assertEqual(loaded,settings)
+                self.assertEqual(loaded.with_reasoning_level('low').reasoning_budget_tokens,budget)
+            for budget in (-2,65537,True,1.5,'2048',None):
+                path.write_text(json.dumps({'reasoning_budget_tokens':budget}),encoding='utf-8')
+                with self.assertRaises(ValueError):
+                    Settings.load(path)
 
     def test_qwen27_reasoning_effort_and_other_local_unlimited_budget(self):
         from desktop_agent.agent import Settings, DesktopServer
@@ -5320,14 +5917,54 @@ class StoreTests(unittest.TestCase):
             payload = client.post.call_args.kwargs['json']
             if level == '9b':
                 self.assertNotIn('reasoning_effort',payload)
+                self.assertNotIn('reasoning_budget_tokens',payload)
             else:
                 self.assertEqual(payload['reasoning_effort'],level)
                 self.assertNotIn('reasoning_budget',payload)
+                self.assertEqual(payload['reasoning_budget_tokens'],0 if level == 'none' else 2048)
+                self.assertEqual(metrics['reasoning_budget_tokens'],payload['reasoning_budget_tokens'])
                 self.assertEqual(payload['max_tokens'],-1)
             self.assertEqual(metrics['reasoning'],synthetic_reasoning)
             notify.assert_any_call('reasoning',synthetic_reasoning)
             self.assertEqual(action['message'],'Done')
             self.assertNotIn(synthetic_reasoning,action['message'])
+
+    def test_reasoning_budget_keeps_answer_completion_and_cancellation_contract(self):
+        import threading
+        from unittest.mock import Mock, MagicMock, patch
+        from desktop_agent.agent import Model, Settings, SYSTEM
+        from game_agent.core import Halted
+        self.assertIn('promptly use permitted search/retrieval tools',SYSTEM)
+        self.assertIn('never bypass permissions or fabricate facts',SYSTEM)
+        for budget in (-1,0,4,4096):
+            for finish in ('stop','length','cancel'):
+                with self.subTest(budget=budget,finish=finish):
+                    stopped=threading.Event()
+                    response=MagicMock();response.__enter__.return_value=response
+                    def stream(**kwargs):
+                        yield 'data: '+json.dumps({'choices':[{'delta':{'reasoning_content':'Synthetic reasoning.'}}]})
+                        if finish == 'cancel':
+                            stopped.set()
+                        yield 'data: '+json.dumps({'choices':[{'delta':{'content':json.dumps({'tool':'finish','arguments':{'text':'Answer'}})},'finish_reason':finish}]})
+                        yield 'data: [DONE]'
+                    response.iter_lines.side_effect=stream
+                    client=MagicMock();client.__enter__.return_value=client;client.post.return_value=response
+                    model=Model(Settings(reasoning_enabled=True,reasoning_effort='xhigh',reasoning_budget_tokens=budget))
+                    model.endpoint='http://127.0.0.1:1234'
+                    with patch('desktop_agent.agent.session',return_value=client),patch.object(model,'cancel') as cancel:
+                        if finish == 'stop':
+                            action,metrics=model.generate([],None,stopped,Mock())
+                            self.assertEqual(action['message'],'Answer')
+                            self.assertEqual(metrics['reasoning_budget_tokens'],budget)
+                        else:
+                            with self.assertRaises(Halted if finish == 'cancel' else ValueError):
+                                model.generate([],None,stopped,Mock())
+                        cancel.assert_not_called()
+                    payload=client.post.call_args.kwargs['json']
+                    self.assertEqual(payload['reasoning_budget_tokens'],budget)
+                    self.assertEqual(payload['reasoning_effort'],'xhigh')
+                    self.assertEqual(payload['max_tokens'],-1)
+                    self.assertTrue(payload['chat_template_kwargs']['enable_thinking'])
 
     def test_click_diagnostic_records_normalized_bounds_and_pointer_without_remapping(self):
         import threading

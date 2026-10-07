@@ -55,7 +55,7 @@ class ToolRunner(Tools):
         if self.browser_tools is None:
             self.browser_tools = snapshot
         worker = self.browser_tools
-        for field in ('allow_browser','mode','stopped','approve','notify','request_intent','tool_policies'):
+        for field in ('allow_browser','mode','stopped','approve','notify','request_intent','tool_policies','call_id'):
             setattr(worker,field,getattr(snapshot,field))
         return worker.execute(action)
 
@@ -95,10 +95,12 @@ class ToolRunner(Tools):
             snapshot.ensure_browser = snapshot.check
             return snapshot.execute(action)
 
-    def submit(self, action, ready=None):
+    def submit(self, action, ready=None, call_id=None):
         self.check_permission(action)
         local_stop = threading.Event()
         snapshot = self.snapshot(StopSignal(self.stopped,local_stop))
+        if call_id is not None:
+            snapshot.call_id = call_id
         snapshot.recording_ready = ready
         name = action['tool']
         if name == 'browser_record':
@@ -112,11 +114,45 @@ class ToolRunner(Tools):
             future = self.pool.submit(snapshot.execute,action)
         return future,local_stop
 
+    def run_parallel(self, action):
+        self.authorize(action)
+        pending,results = [],[]
+        try:
+            for index,child in enumerate(action['arguments']['actions']):
+                child = dict(child)
+                if action['risk']=='sensitive':
+                    child['risk']='sensitive'
+                identity = f'{self.call_id or uuid.uuid4().hex}:{index+1}'
+                pending.append((child,identity,*self.submit(child,call_id=identity)))
+            for child,identity,future,stop in pending:
+                try:
+                    result = future.result()
+                except Exception as failure:
+                    result = ToolResult(str(failure),error=str(failure),interrupted=str(failure) if isinstance(failure,Halted) else '')
+                results.append(dict(tool=child['tool'],call_id=identity,text=result.text,error=result.error,interrupted=result.interrupted))
+                if result.interrupted:
+                    for _,_,_,signal in pending:
+                        signal.set()
+        finally:
+            for _,_,future,signal in pending:
+                signal.set()
+            for _,_,future,_ in pending:
+                try:
+                    future.result()
+                except Exception:
+                    pass
+        error = next((result['error'] for result in results if result['error']),'')
+        interrupted = next((result['interrupted'] for result in results if result['interrupted']),'')
+        return ToolResult(json.dumps({'results':results,'call_id':self.call_id},ensure_ascii=False),
+                          error=error,interrupted=interrupted,call_id=self.call_id)
+
     def execute(self, action):
         validate_action(action)
         self.check()
         self.check_permission(action)
         name, arguments = action['tool'],action['arguments']
+        if name == 'tool_parallel':
+            return self.run_parallel(action)
         if name.startswith('job_'):
             self.authorize(action)
         if name == 'job_start':

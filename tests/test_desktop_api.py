@@ -22,6 +22,278 @@ def synthetic_vertex_account():
 
 
 class APIConfigTests(unittest.TestCase):
+    def test_kaggle_unlimited_output_keeps_context_reserve_and_request_options(self):
+        from desktop_agent.agent import Settings
+        from desktop_agent.kaggle_server import ALIAS
+        config = APISettings(url='https://example.ngrok-free.dev/v1',model=ALIAS,
+                             context_tokens=196608,max_output_tokens=-1,reasoning_effort='xhigh')
+        messages = [{'role':'system','content':'Synthetic test'},{'role':'user','content':'Continue'}]
+        for field in ('auto','max_tokens','max_completion_tokens'):
+            for native in (False,True):
+                with self.subTest(field=field,native=native):
+                    candidate = replace(config,token_limit_field=field,native_tools=native)
+                    payload = build_payload(candidate,messages,tool_names=['finish'])
+                    expected = build_payload(replace(candidate,max_output_tokens=4096),messages,tool_names=['finish'])
+                    limit_field = 'max_tokens' if field=='auto' else field
+                    expected[limit_field] = -1
+                    self.assertEqual(payload,expected)
+        self.assertEqual(config.output_reserve,4096)
+        self.assertEqual(Settings(backend='api',api=config).output_budget,4096)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'settings.json'
+            Settings().with_api_profile('Kaggle',config).use_api_profile('Kaggle').save(path)
+            restored = Settings.load(path)
+            self.assertEqual(restored.api.max_output_tokens,-1)
+            self.assertEqual(restored.api_profiles['Kaggle'].max_output_tokens,-1)
+            self.assertEqual(restored.output_budget,4096)
+        for invalid in (replace(config,format='responses'),replace(config,format='gemini'),
+                        replace(config,format='anthropic'),replace(config,model='other'),
+                        replace(config,url='https://other.example/v1'),replace(config,context_tokens=4096),
+                        replace(config,max_output_tokens=0),replace(config,max_output_tokens=-2),
+                        replace(config,max_output_tokens=True),replace(config,max_output_tokens=-1.0)):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                invalid.validate()
+
+    def test_incomplete_response_is_reported_and_same_task_continues(self):
+        import httpx
+        from unittest.mock import Mock
+        from desktop_agent.agent import Agent, Model, Settings
+        from desktop_agent.store import Store
+        for finish, reason in (('length','output_limit'),(None,'missing_completion'),
+                               ('content_filter','rejected_or_unsupported_finish')):
+            requests = []
+            async def handler(request):
+                requests.append(json.loads(request.content))
+                answer = {'tool':'finish','arguments':{'text':'Discarded partial' if len(requests)==1 else 'Recovered'}}
+                return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(answer)},
+                                                            'finish_reason':finish if len(requests)==1 else 'stop'}]})
+            with self.subTest(finish=finish), tempfile.TemporaryDirectory() as folder:
+                store = Store(folder)
+                identifier = store.create('Incomplete response recovery')
+                settings = Settings(backend='api',max_steps=3,auto_compact=False,
+                                    api=APISettings(url='https://example.test/v1',model='test',stream=False,
+                                                    tokenizer='estimate',max_retries=0))
+                model = Model(settings,Path(folder)/'keys.dpapi')
+                model.remote = APIClient(settings.api,keys=['test-key'],transport=httpx.MockTransport(handler))
+                tools = Mock(allow_screen=False,allow_input=False,allow_browser=False,window=None,mode='manual')
+                Agent(store,model,tools,threading.Event(),Mock()).run(identifier,'Reply briefly')
+                events = store.events(identifier)
+                errors = [event for event in events if event['metadata'].get('tool')=='response_validation']
+                self.assertEqual(len(requests),2)
+                self.assertEqual(len(errors),1)
+                self.assertEqual(errors[0]['metadata']['status'],'error')
+                self.assertEqual(errors[0]['metadata']['reason'],reason)
+                self.assertEqual(errors[0]['metadata']['api_request']['http_status'],200)
+                self.assertIn('Incomplete or rejected API response',json.dumps(requests[1]))
+                self.assertIn('do not bypass',json.dumps(requests[1]))
+                self.assertNotIn('Discarded partial',json.dumps(requests[1]))
+                self.assertEqual(json.loads(events[-1]['content'])['message'],'Recovered')
+                self.assertEqual(len(store.sessions()),1)
+                self.assertEqual(sum(event['role']=='user' for event in events),1)
+                tools.execute.assert_not_called()
+                model.close()
+
+    def test_incomplete_response_recovery_respects_step_limit_and_stop(self):
+        import httpx
+        from unittest.mock import Mock
+        from desktop_agent.agent import Agent, Model, Settings
+        from desktop_agent.store import Store
+        for cancel, expected_requests in ((False,2),(True,1)):
+            requests = []
+            stopped = threading.Event()
+            async def handler(request):
+                requests.append(json.loads(request.content))
+                event = {'choices':[{'delta':{'content':'{"tool":"finish","arguments":'}}]}
+                return httpx.Response(200,headers={'content-type':'text/event-stream'},
+                                      text='data: '+json.dumps(event)+'\n\n')
+            with self.subTest(cancel=cancel), tempfile.TemporaryDirectory() as folder:
+                store = Store(folder)
+                identifier = store.create('Bounded incomplete response recovery')
+                settings = Settings(backend='api',max_steps=2,auto_compact=False,
+                                    api=APISettings(url='https://example.test/v1',model='test',
+                                                    tokenizer='estimate',max_retries=0))
+                model = Model(settings,Path(folder)/'keys.dpapi')
+                model.remote = APIClient(settings.api,keys=['test-key'],transport=httpx.MockTransport(handler))
+                tools = Mock(allow_screen=False,allow_input=False,allow_browser=False,window=None,mode='manual')
+                def notify(kind, value):
+                    if cancel and kind=='refresh' and any(
+                            event['metadata'].get('tool')=='response_validation' for event in store.events(identifier)):
+                        stopped.set()
+                Agent(store,model,tools,stopped,notify).run(identifier,'Reply briefly')
+                events = store.events(identifier)
+                self.assertEqual(len(requests),expected_requests)
+                self.assertEqual(sum(event['metadata'].get('tool')=='response_validation' for event in events),expected_requests)
+                self.assertIn('Stopped' if cancel else 'Step limit',events[-1]['content'])
+                self.assertFalse(any(event['role']=='assistant' for event in events))
+                tools.execute.assert_not_called()
+                model.close()
+
+    def test_timeout_has_no_upper_limit(self):
+        for seconds in (10,120,600,601,10800,86400):
+            with self.subTest(seconds=seconds):
+                config = APISettings(timeout_seconds=seconds)
+                self.assertIs(config.validate(),config)
+                self.assertEqual(config.timeout_seconds,seconds)
+        for invalid in (-1,0,9,True,10800.0,'10800',None):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError,'timeout_seconds'):
+                APISettings(timeout_seconds=invalid).validate()
+
+    def test_long_timeout_reaches_request_and_transport(self):
+        import asyncio
+        import httpx
+        from unittest.mock import patch
+        requests = []
+        async def handler(request):
+            requests.append(request)
+            return httpx.Response(200,json={'choices':[{'message':{'content':'{"tool":"finish","arguments":{"text":"Ready"}}'},'finish_reason':'stop'}]})
+        config = APISettings(url='https://example.test/v1',model='test',stream=False,
+                             timeout_seconds=10800,max_retries=0)
+        client = APIClient(config,keys=['synthetic-key'],transport=httpx.MockTransport(handler))
+        with patch('desktop_agent.api.asyncio.wait',wraps=asyncio.wait) as wait:
+            action, _ = client.generate([{'role':'user','content':'Ready'}],None,threading.Event(),lambda text:None,lambda *args:None)
+        self.assertEqual(action['tool'],'finish')
+        self.assertEqual(wait.call_args.kwargs['timeout'],10800)
+        self.assertEqual(len(requests),1)
+        timeout = requests[0].extensions['timeout']
+        self.assertEqual(timeout,dict(connect=10,read=10800,write=10800,pool=10800))
+
+    def test_kaggle_expired_tunnel_reports_url_change_without_retry_or_private_body(self):
+        import httpx
+        from desktop_agent.kaggle_server import ALIAS
+        for body, expired in ((b'<h1>no tunnel here :(</h1> private-response-value',True),
+                              (b'<h1>Server busy</h1> private-response-value',False)):
+            requests = []
+            async def handler(request):
+                requests.append(request)
+                return httpx.Response(503, content=body, headers={'Content-Type':'text/html'})
+            config = APISettings(url='https://expired.lhr.life/v1', model=ALIAS, max_retries=0)
+            client = APIClient(config, keys=['synthetic-key'], transport=httpx.MockTransport(handler))
+            with self.subTest(expired=expired), self.assertRaises(ValueError) as caught:
+                client.generate([{'role':'user','content':'Ready'}],None,threading.Event(),lambda text:None,lambda *args:None)
+            message = str(caught.exception)
+            self.assertIn('API HTTP 503', message)
+            self.assertEqual('latest API_URL' in message, expired)
+            self.assertNotIn('private-response-value', message)
+            self.assertNotIn('synthetic-key', message)
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(caught.exception.api_diagnostics['attempts'], 1)
+
+    def test_invalid_tool_call_is_logged_and_corrected_in_same_task(self):
+        import httpx
+        from unittest.mock import Mock
+        from desktop_agent.agent import Agent, Model, Settings
+        from desktop_agent.store import Store
+        requests = []
+        async def handler(request):
+            payload = json.loads(request.content)
+            requests.append(payload)
+            answer = ({'tool':'finish','arguments':{'text':'Discarded'},'unexpected':True}
+                      if len(requests)==1 else {'tool':'finish','arguments':{'text':'Corrected'}})
+            return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(answer)},'finish_reason':'stop'}]})
+        with tempfile.TemporaryDirectory() as folder:
+            store = Store(folder)
+            identifier = store.create('Recovery')
+            settings = Settings(backend='api', max_steps=3, auto_compact=False,
+                                api=APISettings(url='https://example.test/v1',model='test',stream=False,tokenizer='estimate',max_retries=0))
+            model = Model(settings, Path(folder)/'keys.dpapi')
+            model.remote = APIClient(settings.api,keys=['test-key'],transport=httpx.MockTransport(handler))
+            tools = Mock(allow_screen=False,allow_input=False,allow_browser=False,window=None,mode='manual')
+            Agent(store,model,tools,threading.Event(),Mock()).run(identifier,'Reply briefly')
+            events = store.events(identifier)
+            errors = [event for event in events if event['metadata'].get('tool')=='call_validation']
+            self.assertEqual(len(requests),2)
+            self.assertEqual(len(errors),1)
+            self.assertEqual(errors[0]['metadata']['status'],'error')
+            self.assertEqual(errors[0]['metadata']['api_request']['http_status'],200)
+            self.assertIn('Invalid tool call',json.dumps(requests[1]))
+            self.assertEqual(json.loads(events[-1]['content'])['message'],'Corrected')
+            self.assertEqual(len(store.sessions()),1)
+            self.assertEqual(sum(event['role']=='user' for event in events),1)
+            tools.execute.assert_not_called()
+            model.close()
+
+    def test_invalid_tool_call_recovery_keeps_step_limit_and_transport_errors_terminal(self):
+        import httpx
+        from unittest.mock import Mock
+        from desktop_agent.agent import Agent, Model, Settings
+        from desktop_agent.store import Store
+        for status, expected_requests, expected_validation in ((200,2,2),(503,1,0)):
+            requests = []
+            async def handler(request):
+                requests.append(request)
+                return httpx.Response(status,json={'choices':[{'message':{'content':'{"tool":"finish","arguments":{},"extra":true}'},'finish_reason':'stop'}]})
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as folder:
+                store=Store(folder)
+                identifier=store.create('Bounded recovery')
+                settings=Settings(backend='api',max_steps=2,auto_compact=False,
+                                  api=APISettings(url='https://example.test/v1',model='test',stream=False,tokenizer='estimate',max_retries=0))
+                model=Model(settings,Path(folder)/'keys.dpapi')
+                model.remote=APIClient(settings.api,keys=['test-key'],transport=httpx.MockTransport(handler))
+                tools=Mock(allow_screen=False,allow_input=False,allow_browser=False,window=None,mode='manual')
+                Agent(store,model,tools,threading.Event(),Mock()).run(identifier,'Reply briefly')
+                events=store.events(identifier)
+                self.assertEqual(len(requests),expected_requests)
+                self.assertEqual(sum(event['metadata'].get('tool')=='call_validation' for event in events),expected_validation)
+                self.assertIn('Step limit' if status==200 else 'HTTP 503',events[-1]['content'])
+                tools.execute.assert_not_called()
+                model.close()
+
+    def test_kaggle_schema_enforces_only_loaded_tools_without_changing_other_providers(self):
+        from desktop_agent.kaggle_server import ALIAS
+        from desktop_agent.protocol import compact_schema
+        config = APISettings(url='https://example.lhr.life/v1', model=ALIAS, tokenizer='estimate')
+        messages = [{'role':'system','content':'Synthetic test'}, {'role':'user','content':'Ready'}]
+        names = ['finish','browser_read']
+        payload = build_payload(config, messages, tool_names=names)
+        schema = payload['response_format']['json_schema']
+        self.assertEqual(payload['response_format']['type'], 'json_schema')
+        self.assertTrue(schema['strict'])
+        self.assertEqual(schema['schema'], compact_schema(names))
+        self.assertEqual(payload['messages'], messages)
+        for branch in schema['schema']['oneOf']:
+            self.assertEqual(set(branch['properties']), {'tool','arguments'})
+            self.assertFalse(branch['additionalProperties'])
+        for other in (replace(config, url='https://other.example/v1'),
+                      replace(config, url='https://example.lhr.life.evil.test/v1'),
+                      replace(config, model='other-model')):
+            with self.subTest(url=other.url, model=other.model):
+                self.assertEqual(build_payload(other, messages, tool_names=names)['response_format'], {'type':'json_object'})
+        self.assertNotIn('response_format', build_payload(replace(config, structured_output=False), messages, tool_names=names))
+        native = build_payload(replace(config, native_tools=True), messages, tool_names=names)
+        self.assertNotIn('response_format', native)
+        self.assertEqual([item['function']['name'] for item in native['tools']], names)
+        client = APIClient(config, keys=['test-key'])
+        client.tool_names = names
+        plain = APIClient(replace(config, structured_output=False), keys=['test-key'])
+        self.assertGreater(client.count('Synthetic test'), plain.count('Synthetic test'))
+
+    def test_kaggle_schema_roundtrip_still_rejects_extra_fields_without_retry(self):
+        import httpx
+        from desktop_agent.kaggle_server import ALIAS
+        from desktop_agent.protocol import normalize_call
+        for extra in (False, True):
+            requests = []
+            answer = {'tool':'finish','arguments':{'text':'Ready'}}
+            if extra:
+                answer['unexpected'] = 'private-extra-value'
+            async def handler(request):
+                payload = json.loads(request.content)
+                requests.append(payload)
+                self.assertEqual(payload['response_format']['type'], 'json_schema')
+                return httpx.Response(200, json={'choices':[{'message':{'content':json.dumps(answer)},'finish_reason':'stop'}]})
+            config = APISettings(url='https://example.lhr.life/v1', model=ALIAS, stream=False, max_retries=2)
+            client = APIClient(config, keys=['test-key'], transport=httpx.MockTransport(handler))
+            client.tool_names = ['finish']
+            with self.subTest(extra=extra):
+                if extra:
+                    with self.assertRaisesRegex(ValueError, 'Only tool and arguments') as caught:
+                        client.generate([{'role':'user','content':'Ready'}], None, threading.Event(), lambda text:None, lambda *args:None)
+                    self.assertNotIn('private-extra-value', str(caught.exception))
+                else:
+                    action, _ = client.generate([{'role':'user','content':'Ready'}], None, threading.Event(), lambda text:None, lambda *args:None)
+                    self.assertEqual(action, normalize_call(answer))
+                self.assertEqual(len(requests), 1)
+
     def test_image_size_option_and_pixel_dimensions_in_all_transports(self):
         import base64
         import io
@@ -214,6 +486,27 @@ class APIConfigTests(unittest.TestCase):
                 client.generate([],None,threading.Event(),lambda text:None,lambda *args:None)
             self.assertIn(expected,str(error.exception))
             self.assertNotIn('private-content',str(error.exception))
+
+    def test_long_reasoning_does_not_abort_answer(self):
+        thinking = 'x' * 250001
+        events = {
+            'openai': {'choices':[{'delta':{'reasoning_content':thinking}}]},
+            'responses': {'type':'response.reasoning_summary_text.delta','delta':thinking},
+            'gemini': {'candidates':[{'content':{'parts':[{'thought':True,'text':thinking}]}}]},
+            'anthropic': {'type':'content_block_delta','delta':{'type':'thinking_delta','thinking':thinking}},
+        }
+        for format, event in events.items():
+            with self.subTest(format=format):
+                result = StreamResult(format)
+                result.consume(event)
+                self.assertEqual(result.thinking, thinking)
+                result.text = 'Completed answer'
+                result.terminal = True
+                result.finish = {'openai':'stop','responses':'completed','gemini':'STOP','anthropic':'end_turn'}[format]
+                self.assertEqual(result.action()['message'], 'Completed answer')
+                result.text = 'x' * 100001
+                with self.assertRaisesRegex(ValueError, 'client size limit'):
+                    result.consume({})
 
     def test_plain_nvidia_greeting_is_a_reply_and_never_executes_tools(self):
         import httpx

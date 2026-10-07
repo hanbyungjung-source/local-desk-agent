@@ -5,7 +5,7 @@ from game_agent import models as shared
 
 
 Q2_XL = {
-    'label':'Qwen3.8 27B UD-Q2_K_XL / RTX5050 + RX580 / post-encode front51-54 residency (8K, Q8 KV, cache OFF) / GCN medium + FA BR8 + IQ3S TPB16 / MTP OFF',
+    'label':'Qwen3.8 27B UD-Q2_K_XL / RTX5050 + RX580 / profile-aware front51-54 residency / GCN medium + FA BR8 + IQ3S TPB16 / MTP OFF',
     'model':'Qwen3.8-27B-UD-Q2_K_XL.gguf',
     'projector':'mmproj-Qwen3.8-27B-Q8_0.gguf',
     'image_min_tokens':1024,'image_max_tokens':1024,
@@ -18,11 +18,13 @@ Q2_MEDIUM_BACKEND = VULKAN_BACKEND.parent.with_name('llama-b11000-vulkan-gcn-med
 Q2_BR8_BACKEND = VULKAN_BACKEND.parent.with_name('llama-b11000-vulkan-gcn-medium-br8')/'ggml-vulkan.dll'
 Q2_TPB16_BACKEND = VULKAN_BACKEND.parent.with_name('llama-b11000-vulkan-gcn-br8-tpb16')/'ggml-vulkan.dll'
 Q2_FRONT_RUNTIME = VULKAN_BACKEND.parent.with_name('llama-b11000-front-postencode')
+Q2_PROFILE_RUNTIME = VULKAN_BACKEND.parent.with_name('llama-b11000-front-profiles-v3')
 
 
 def uses_front_residency(model,projector,context_tokens,cache_ram_mib):
     return (model_preset(model) is Q2_XL and Path(projector).name.casefold()==Q2_XL['projector'].casefold()
-            and context_tokens==8192 and cache_ram_mib==0)
+            and type(context_tokens) is int and 4096<=context_tokens<=65536 and context_tokens%1024==0
+            and type(cache_ram_mib) is int and cache_ram_mib in (0,2048))
 
 
 def model_preset(model):

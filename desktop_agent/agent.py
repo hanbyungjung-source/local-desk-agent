@@ -59,6 +59,7 @@ class Settings:
     reasoning_enabled: bool = False
     reasoning_tokens: int = 256
     reasoning_effort: str = 'medium'
+    reasoning_budget_tokens: int = 2048
     context_tokens: int = 8192
     cache_ram_mib: int = 0
     kv_cache_type: str = 'default'
@@ -71,6 +72,19 @@ class Settings:
     workspace_root: str = ''
     tool_policies: dict[str,str] = field(default_factory=dict)
     auto_compact: bool = True
+    compaction_trigger_percent: int = 85
+    compaction_target_percent: int = 65
+
+    def validate_reasoning_budget(self):
+        if type(self.reasoning_budget_tokens) is not int or not -1 <= self.reasoning_budget_tokens <= 65536:
+            raise ValueError('Reasoning token budget must be -1 (unlimited), 0 (immediate answer), or 1..65536')
+
+    def validate_compaction(self):
+        if type(self.auto_compact) is not bool:
+            raise ValueError('Invalid automatic context compaction setting')
+        trigger,target=self.compaction_trigger_percent,self.compaction_target_percent
+        if type(trigger) is not int or type(target) is not int or not 1 <= target < trigger <= 100:
+            raise ValueError('Compaction percentages must satisfy 1 <= target < trigger <= 100')
 
     @property
     def local_image_tokens(self):
@@ -147,7 +161,7 @@ class Settings:
     @property
     def output_budget(self):
         if self.backend == 'api':
-            return self.api.max_output_tokens
+            return self.api.output_reserve
         if self.uses_reasoning_effort:
             return 2048 if self.reasoning_enabled else 768
         return 768+(self.reasoning_tokens if self.reasoning_enabled else 0)
@@ -185,6 +199,7 @@ class Settings:
             raise ValueError('Invalid reasoning settings')
         if result.reasoning_effort not in QWEN_REASONING_EFFORTS:
             raise ValueError('Invalid local reasoning effort')
+        result.validate_reasoning_budget()
         validate_context(result.context_tokens)
         if type(result.cache_ram_mib) is not int or result.cache_ram_mib not in (0,2048):
             raise ValueError('RAM prompt cache must be 0 or 2048 MiB')
@@ -199,8 +214,7 @@ class Settings:
         from desktop_agent.protocol import TOOL_POLICIES
         if not isinstance(result.workspace_root,str):
             raise ValueError('Invalid workspace root')
-        if type(result.auto_compact) is not bool:
-            raise ValueError('Invalid automatic context compaction setting')
+        result.validate_compaction()
         if not isinstance(result.tool_policies,dict) or any(name not in TOOLS or value not in TOOL_POLICIES for name,value in result.tool_policies.items()):
             raise ValueError('Invalid tool policy settings')
         result.api.validate()
@@ -229,6 +243,7 @@ TOOLS AND PERMISSIONS
 1. Choose from LOADED TOOLS; follow its arguments/defaults/limits. Never invent paths, IDs or hashes.
 2. Need an unloaded available group? Call {"tool":"load_tool_group","arguments":{"groups":["workspace"]}} first. Loading does not grant permission. Ask the user to enable an unavailable tool; never bypass a denial with another tool.
 3. Call once, read the result, then choose the next action. Report evidence, uncertainty and blockers; never invent success.
+- When facts are unknown, uncertain or time-sensitive, promptly use permitted search/retrieval tools instead of prolonged speculation. For web facts use browser search; for local files/code use workspace search/read. Load an available group if needed, inspect sources, and distinguish verified facts from uncertainty. If access is disabled or results are insufficient, ask or state the limitation; never bypass permissions or fabricate facts.
 - File changes and shell starts always require confirmation. Sensitive-action checks still apply.
 - Shell commands may run ONLY through an enabled terminal_start, never desktop terminals, launchers or developer consoles. No elevation, credentials or interactive programs.
 - background=true requires schema support. Job results are collected automatically; finish waits for jobs, but cancels unfinished PowerShell executions. Never restart pending work just to get its output.
@@ -264,6 +279,8 @@ def system_prompt(capabilities, catalog=None):
         extra += '\nRECORDING\nRecord only when requested. With background=true, wait for ready before interaction. Video images contain up to four silent sampled frames, not every event.'
     if 'advanced_input' in catalog.loaded:
         extra += '\nADVANCED INPUT\ndelay_ms waits BEFORE each queued key. Hold/drag release on completion/cancel. Message mode may be unsupported; no modifier chords. Never replay a partly executed queue.'
+    if 'automation' in catalog.loaded:
+        extra += '\nAUTOMATION\nFor user-requested repetition use desktop_macro or browser_macro once, not repeated model calls. actions is an ordered list of ordinary compact calls on one target. For text then Enter twice, use type, key Enter, key Enter; repeat=100 and interval_ms=500 means a 500ms wait between completed repetitions, not exact start-to-start timing. Only use loaded, permitted child tools. Never nest macros/jobs inside actions. background=true allows independent work; collect results before finish. Desktop input stays serialized for the entire macro; managed browser actions stay on their owning thread. tool_parallel runs up to four independent read-only calls, never calls needing another result. Inspect every child error, completed_iterations/completed_actions and last_action. Partial work is not safe to replay; report the stopping point.'
     if 'files' in catalog.loaded:
         extra += '\nATTACHMENTS AND RECORDS\nfile_read and file_view accept only registered session attachment/artifact paths, not arbitrary workspace paths. file_view follows IMAGES above. session_history reads the full log; session_record reads one event from raw_ref. Keep event_id, advance offset with next_offset until null. Log offsets count characters, not terminal bytes.'
     if 'workspace' in catalog.loaded:
@@ -281,7 +298,7 @@ def system_prompt(capabilities, catalog=None):
         if 'workspace_apply_patch' in names:
             extra += '\nEDIT AFTER READING\n1. Use the latest sha256 as expected_sha256. old_text must match once: remove displayed line-number prefixes; preserve whitespace and the returned line_ending. new_text is replacement text, NOT a unified diff.\n2. After confirmation, inspect returned status/hash/diff. On conflict, read again; never overwrite intervening changes. applied means changed, not tested.\n3. New file: empty expected_sha256 and old_text, existing parent folder. Never bypass link/protected-file rejection through a shell.'
     if 'terminal' in catalog.loaded:
-        extra += '\nTERMINAL WORKFLOW\n1. terminal_start once: command, relative cwd, suitable timeout_seconds. PowerShell 5.1 uses ; or pipelines, not &&. Each call starts a fresh shell; variables/cwd changes do not persist. cwd is not a sandbox: files and networks outside it are accessible.\n2. Keep execution_id; terminal_output reads that execution. offset and next_offset are byte positions. running/starting is pending; consult state.terminals, do not restart.\n3. Check status, exit_code AND relevant output. completed/exit_code=0 proves process exit, not the user goal. Report failure/timeout/cancel/output-limit/unknown honestly. terminal_stop targets owned executions only.\nfinish cancels unfinished PowerShell executions; it does not wait. Task time/step limits still apply. No persistent servers. Prefer workspace tools for files.'
+        extra += '\nTERMINAL WORKFLOW\n1. terminal_start once: command, relative cwd, suitable timeout_seconds. PowerShell 5.1 uses ; or pipelines, not &&. Each call starts a fresh shell; variables/cwd changes do not persist. cwd is not a sandbox: files and networks outside it are accessible.\n2. Keep execution_id; terminal_output reads that execution. offset and next_offset are byte positions. running/starting is pending; consult state.terminals, do not restart.\n3. Check status, exit_code AND relevant output. completed/exit_code=0 proves process exit, not the user goal. Report failure/timeout/cancel/output-limit/unknown honestly. terminal_stop targets owned executions only.\nfinish cancels unfinished PowerShell executions; it does not wait. Step limits and explicit terminal timeouts still apply. No persistent servers. Prefer workspace tools for files.'
     if any(name.startswith('desktop_') or name=='window_select' for name in names):
         extra += '\nDESKTOP COORDINATES\nSelect a listed window before input. x/y/end_x/end_y are integer image PIXELS, top-left origin, coordinate_space="image_pixels". Do NOT normalize to 0..1000 or add screen offsets. Use coordinate_reference (selected-window pixel size before a screenshot). Never reuse old normalized coordinates as pixels; inspect uncertain targets.\ndesktop_capture uses the selected window, or the desktop if none. Margin includes surroundings but never expands input permission. desktop_screen_capture covers visible monitors. Managed browser and external windows are separate.'
     if any('key' in name or 'input' in name or 'hold' in name for name in names):
@@ -411,6 +428,45 @@ def prompt_cache_metrics(usage, system_text, *, requested, timings=None):
                 system_text_sha256=hashlib.sha256(system_text.encode('utf-8')).hexdigest())
 
 
+def request_cache_trace(payload, origins, previous=None, scope=None):
+    started=time.perf_counter()
+    def fingerprint(value):
+        encoded=json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')
+        return hashlib.sha256(encoded).hexdigest(),len(encoded)
+    records=[]
+    for index,message in enumerate(payload['messages']):
+        origin=origins[index] if index<len(origins) else {}
+        content=message.get('content')
+        image=isinstance(content,list) and any(part.get('type')=='image_url' for part in content if isinstance(part,dict))
+        kind='image' if image else 'system' if message['role']=='system' else 'history' if origin.get('_event_id') is not None else 'state_or_memory' if origin.get('_status') else 'message'
+        hashed,size=fingerprint(message)
+        records.append(dict(index=index,role=message['role'],kind=kind,event_id=origin.get('_event_id'),sha256=hashed,bytes=size))
+    options,_=fingerprint({key:value for key,value in payload.items() if key!='messages'})
+    purpose='compaction' if any(message['role']=='system' and isinstance(message['content'],str) and '\n\nCONTEXT COMPACTION MODE\n' in message['content'] for message in payload['messages']) else 'action'
+    current=dict(scope=scope,records=records,options_sha256=options,purpose=purpose)
+    available=previous is not None and previous['scope']==scope
+    trace=dict(previous_request_available=available,purpose=purpose,unit='messages_not_tokens',
+               current_message_count=len(records),raw_content_saved=False)
+    if available:
+        old=previous['records']
+        common=0
+        for before,after in zip(old,records):
+            if before['sha256']!=after['sha256']:
+                break
+            common+=1
+        old_images=[record['sha256'] for record in old if record['kind']=='image']
+        new_images=[record['sha256'] for record in records if record['kind']=='image']
+        trace.update(previous_purpose=previous['purpose'],common_prefix_messages=common,
+                     previous_message_count=len(old),same_request_options=previous['options_sha256']==options,
+                     same_image_messages=old_images==new_images if old_images or new_images else None,
+                     first_changed_previous=old[common] if common<len(old) else None,
+                     first_changed_current=records[common] if common<len(records) else None)
+    else:
+        trace['reset_reason']='server_changed' if previous is not None else 'no_successful_previous_request'
+    trace['fingerprinting_seconds']=time.perf_counter()-started
+    return current,trace
+
+
 def validate_context(tokens):
     if type(tokens) is not int or not 4096 <= tokens <= 65536 or tokens % 1024:
         raise ValueError('Context must be 4096..65536 in multiples of 1024')
@@ -447,7 +503,7 @@ class DesktopServer(LocalServer):
     residency_guard = None
 
     def front_enabled(self,model,projector,image_min_tokens=1024,image_max_tokens=1024):
-        return (self.use_front_residency and self.kv_cache_type in ('default','q8_0') and image_min_tokens==image_max_tokens==1024
+        return (self.use_front_residency and self.kv_cache_type in ('default','q4_0','q8_0','f16') and image_min_tokens==image_max_tokens==1024
                 and uses_front_residency(model,projector,self.context_tokens,self.cache_ram_mib))
 
     def settings_for(self, *args, **kwargs):
@@ -476,7 +532,7 @@ class DesktopServer(LocalServer):
         elif '--reasoning-budget' in options:
             options[options.index('--reasoning-budget')+1] = '-1'
         options += ['--load-mode','none','--cache-ram',str(self.cache_ram_mib)]
-        executable = str(residency.models.Q2_FRONT_RUNTIME/'llama-server.exe') if self.front_enabled(*settings[1:5]) else settings[0]
+        executable = str(residency.models.Q2_PROFILE_RUNTIME/'llama-server.exe') if self.front_enabled(*settings[1:5]) else settings[0]
         return (executable,*settings[1:-1],tuple(options))
 
     def environment_for(self,model,projector):
@@ -493,15 +549,17 @@ class DesktopServer(LocalServer):
         self.close()
         environment=self.environment_for(model,projector)
         if front:
-            record,environment=residency.deployment(model,projector)
-            executable=str(residency.models.Q2_FRONT_RUNTIME/'llama-server.exe')
+            profile=residency.front_profile(self.context_tokens,self.kv_cache_type,self.cache_ram_mib)
+            record,environment=residency.deployment(model,projector,profile=profile)
+            executable=str(residency.models.Q2_PROFILE_RUNTIME/'llama-server.exe')
             self.residency_guard=residency.ResidencyGuard(self,stopped,record)
+        guard=self.residency_guard
         try:
-            if self.residency_guard: self.residency_guard.start()
+            if guard: guard.start()
             return super().start(executable,model,projector,log_path,stopped,image_min_tokens,image_max_tokens,
                                  enabled,reasoning_tokens,environment=environment)
         except Exception as error:
-            reason=self.residency_guard.reason if self.residency_guard else ''
+            reason=guard.reason if guard else ''
             self.close()
             if reason: raise RuntimeError(reason) from error
             raise
@@ -583,6 +641,7 @@ class Model:
             if guard: guard.end_request()
 
     def _generate(self, messages, image, stopped, notify):
+        from desktop_agent.protocol import InvalidToolCall
         self.partial = ''
         self.reasoning_text = ''
         guide_text='\n'.join(message['content'] for message in messages if message.get('role')=='system' and isinstance(message.get('content'),str))
@@ -594,9 +653,13 @@ class Model:
             client.tool_names = self.tool_names
             result = client.generate(messages,image,stopped,on_text,notify)
             result[1]['prompt_cache']=prompt_cache_metrics(result[1].get('usage') or {},guide_text,requested=None)
-            require_pixel_coordinates(result[0])
+            try:
+                require_pixel_coordinates(result[0])
+            except ValueError as error:
+                raise InvalidToolCall(str(error)) from None
             self.partial = ''
             return result
+        origins=messages
         messages = [{'role':message['role'],'content':message['content']} for message in messages]
         if image is not None:
             url, info = encode_image(image, self.settings.image_max_edge or None, 90, 'rgb')
@@ -609,8 +672,13 @@ class Model:
                    'chat_template_kwargs':{'enable_thinking':self.settings.reasoning_enabled},
                    'response_format':{'type':'json_schema','json_schema':{'name':'desktop_action','strict':True,'schema':compact_schema(self.tool_names or ToolCatalog(dict(screen=True,input=True,browser=True)).names())}}}
         if self.settings.uses_reasoning_effort:
+            self.settings.validate_reasoning_budget()
             payload['reasoning_effort'] = self.settings.reasoning_effort if self.settings.reasoning_enabled else 'none'
             payload['reasoning_format'] = 'deepseek'
+            payload['reasoning_budget_tokens'] = self.settings.reasoning_budget_tokens if self.settings.reasoning_enabled else 0
+        current_cache,cache_transition=request_cache_trace(payload,origins,getattr(self,'_cache_request',None),
+                                                          (self.endpoint,id(self.server.process)))
+        self._cache_request=None
         raw, finish, usage, reasoning = '', None, {}, ''
         timings = {}
         first_token_seconds = None
@@ -648,14 +716,22 @@ class Model:
             raise Halted('Stopped; response discarded')
         if finish != 'stop':
             raise ValueError('Incomplete model response; no tool executed: '+str(finish))
-        action = normalize_call(json.loads(raw),self.tool_names)
-        require_pixel_coordinates(action)
+        try:
+            action = normalize_call(json.loads(raw),self.tool_names)
+            require_pixel_coordinates(action)
+        except json.JSONDecodeError:
+            raise InvalidToolCall('Model action JSON is malformed; no tool executed') from None
+        except (ValueError,TypeError) as error:
+            raise InvalidToolCall(str(error)) from None
         self.partial = ''
+        self._cache_request=current_cache
         return action, {'seconds':time.monotonic()-started, 'usage':usage, 'timings':timings,
             'prompt_cache':prompt_cache_metrics(usage,guide_text,requested=True,timings=timings),
+            'cache_transition':cache_transition,
             'first_token_seconds':first_token_seconds,
                 'reasoning':reasoning, 'image_count':int(image is not None),
-                **({'reasoning_effort':payload['reasoning_effort']} if self.settings.uses_reasoning_effort else {})}
+                **({'reasoning_effort':payload['reasoning_effort'],
+                    'reasoning_budget_tokens':payload['reasoning_budget_tokens']} if self.settings.uses_reasoning_effort else {})}
 
     def cancel(self):
         if self.remote is not None:
@@ -671,6 +747,7 @@ class Model:
         if self.remote is not None:
             self.remote.cancel()
             self.remote = None
+        self._cache_request=None
         self.server.close()
 
 
@@ -678,6 +755,30 @@ class Agent:
     def __init__(self, store, model, tools, stopped, notify):
         self.store, self.model, self.tools = store, model, tools
         self.stopped, self.notify = stopped, notify
+
+    def log_invalid_call(self, identifier, error):
+        details = getattr(error,'api_diagnostics',None)
+        metadata = {'api_request':details} if isinstance(details,dict) else {}
+        self.store.append(identifier,'tool',
+            'Invalid tool call; no tool executed. '+str(error)+
+            ' Return a corrected call using only the loaded tools and valid arguments, or finish with the blocker.',
+            tool='call_validation',status='error',**metadata)
+        self.notify('stream','')
+        self.notify('status','\ub3c4\uad6c \ud638\ucd9c \uc624\ub958\ub97c \uae30\ub85d\ud588\uc2b5\ub2c8\ub2e4. \uac19\uc740 \uc791\uc5c5\uc5d0\uc11c \uc218\uc815 \uc751\ub2f5\uc744 \uc694\uccad\ud569\ub2c8\ub2e4.')
+        self.notify('refresh',None)
+
+    def log_incomplete_response(self, identifier, error):
+        details = getattr(error,'api_diagnostics',None)
+        metadata = {'api_request':details} if isinstance(details,dict) else {}
+        self.store.append(identifier,'tool',
+            str(error)+'. No action from this response was executed; earlier completed actions remain valid. '
+            'Continue the same task from the recorded results, not from partial response text. '
+            'For an incomplete response or output limit, return a shorter complete response with one valid call. '
+            'If the request was refused or blocked, respect that restriction and finish with the blocker; do not bypass it.',
+            tool='response_validation',status='error',reason=error.reason,**metadata)
+        self.notify('stream','')
+        self.notify('status','API \uc751\ub2f5 \uc624\ub958\ub97c \uae30\ub85d\ud588\uc2b5\ub2c8\ub2e4. \uac19\uc740 \uc791\uc5c5\uc5d0\uc11c \uc751\ub2f5\uc744 \ub2e4\uc2dc \uc694\uccad\ud569\ub2c8\ub2e4.')
+        self.notify('refresh',None)
 
     def save_result(self, identifier, requested, result, call_id=''):
         name = result.tool or requested
@@ -733,6 +834,8 @@ class Agent:
         return image
 
     def run(self, identifier, prompt, attachments=()):
+        from desktop_agent.api import IncompleteAPIResponse
+        from desktop_agent.protocol import InvalidToolCall
         if not prompt.strip() and not attachments:
             return
         files = save_attachments(attachments,self.store.artifact_directory(identifier)) if attachments else []
@@ -804,15 +907,27 @@ class Agent:
                 receiving_response = True
                 self.notify('reasoning_start',{'session_id':identifier,'request_id':request_id,'step':step,
                                               'enabled':self.model.settings.backend=='local' and self.model.settings.reasoning_enabled})
-                action, metrics = self.model.generate(messages, current_image, self.stopped, self.notify)
+                try:
+                    action, metrics = self.model.generate(messages, current_image, self.stopped, self.notify)
+                except IncompleteAPIResponse as error:
+                    receiving_response = False
+                    if self.stopped.is_set():
+                        raise Halted('Stopped; incomplete API response discarded')
+                    self.log_incomplete_response(identifier,error)
+                    continue
+                except InvalidToolCall as error:
+                    receiving_response = False
+                    if self.stopped.is_set():
+                        raise Halted('Stopped; invalid generated call discarded')
+                    self.log_invalid_call(identifier,error)
+                    continue
                 receiving_response = False
                 if self.stopped.is_set():
                     raise Halted('Stopped; generated call discarded')
                 try:
                     action = catalog.normalize(action)
                 except ValueError as error:
-                    self.store.append(identifier,'tool',str(error),status='error',tool='call_validation')
-                    self.notify('refresh',None)
+                    self.log_invalid_call(identifier,error)
                     continue
                 if action['tool'] == 'finish' and isinstance(self.tools,ToolRunner) and self.tools.background:
                     for result in self.tools.drain():

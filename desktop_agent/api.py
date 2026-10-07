@@ -14,6 +14,12 @@ FORMATS = ('openai','responses','gemini','anthropic')
 TOKENIZERS = ('o200k_base','cl100k_base','p50k_base','r50k_base','estimate')
 
 
+class IncompleteAPIResponse(ValueError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__('Incomplete or rejected API response; no tool executed ('+reason+')')
+
+
 @dataclass
 class APISettings:
     format: str = 'openai'
@@ -39,6 +45,10 @@ class APISettings:
     timeout_seconds: int = 120
     max_retries: int = 2
 
+    @property
+    def output_reserve(self):
+        return 4096 if self.max_output_tokens == -1 else self.max_output_tokens
+
     def validate(self):
         if self.format not in FORMATS or self.tokenizer not in TOKENIZERS:
             raise ValueError('Unknown API format/tokenizer')
@@ -60,13 +70,19 @@ class APISettings:
             raise ValueError('Claude uses reasoning_effort (adaptive) or thinking_budget')
         if self.format == 'anthropic' and self.thinking_budget not in (-1,0) and self.thinking_budget < 1024:
             raise ValueError('Claude thinking_budget must be at least 1024')
-        if self.thinking_budget >= self.max_output_tokens:
+        if type(self.max_output_tokens) is not int or not (self.max_output_tokens == -1 or 256 <= self.max_output_tokens <= 131072):
+            raise ValueError('Invalid max_output_tokens; use 256..131072 or -1 for Kaggle')
+        if self.max_output_tokens == -1 and not uses_kaggle_schema(self):
+            raise ValueError('Unlimited output (-1) requires the Kaggle Qwen OpenAI profile')
+        if self.max_output_tokens != -1 and self.thinking_budget >= self.max_output_tokens:
             raise ValueError('Thinking budget must be smaller than max output tokens')
-        for value, minimum, maximum in ((self.context_tokens,4096,2097152),(self.max_output_tokens,256,131072),
-                                        (self.thinking_budget,-1,65536),(self.timeout_seconds,10,600),(self.max_retries,0,10)):
+        for value, minimum, maximum in ((self.context_tokens,4096,2097152),
+                                        (self.thinking_budget,-1,65536),(self.max_retries,0,10)):
             if type(value) is not int or not minimum <= value <= maximum:
                 raise ValueError('API numeric setting out of range')
-        if self.max_output_tokens+2048 >= self.context_tokens:
+        if type(self.timeout_seconds) is not int or self.timeout_seconds < 10:
+            raise ValueError('API timeout_seconds must be an integer of at least 10 seconds')
+        if self.output_reserve+2048 >= self.context_tokens:
             raise ValueError('Context must exceed output budget by more than 2048 tokens')
         if any(type(value) is not bool for value in (self.stream,self.vertex,self.include_thoughts,self.structured_output,self.native_tools)):
             raise ValueError('Invalid API toggle')
@@ -125,6 +141,13 @@ def endpoint(config):
 def uses_google_thinking(config):
     return config.format == 'openai' and (config.vertex or
         urlsplit(config.url).hostname == 'generativelanguage.googleapis.com')
+
+
+def uses_kaggle_schema(config):
+    from desktop_agent.kaggle_server import ALIAS, is_ngrok_host
+    host = urlsplit(config.url).hostname or ''
+    return (config.format == 'openai' and not config.vertex and config.model == ALIAS and
+            (host.endswith(('.lhr.life','.localhost.run')) or is_ngrok_host(host)))
 
 
 def default_tool_names():
@@ -210,6 +233,10 @@ def build_payload(config, messages, image=None, tool_names=None, *, image_max_ed
             payload['stream_options'] = {'include_usage':True}
         if config.structured_output:
             payload['response_format'] = {'type':'json_object'}
+            if uses_kaggle_schema(config):
+                from desktop_agent.protocol import compact_schema
+                payload['response_format'] = {'type':'json_schema','json_schema':{
+                    'name':'desktop_action','strict':True,'schema':compact_schema(names)}}
         if config.native_tools:
             payload.pop('response_format',None)
             payload['tools'] = native_definitions(names)
@@ -394,22 +421,27 @@ class StreamResult:
                 self.thinking = ''.join(part.get('thinking','') for part in event.get('content',[]) if part.get('type') == 'thinking')
                 self.finish,self.terminal = event.get('stop_reason'),True
                 self.usage.update(event.get('usage') or {})
-        if len(self.text) > 100000 or len(self.thinking) > 200000 or len(self.function_arguments) > 30000 or len(self.function_name) > 100:
+        if len(self.text) > 100000 or len(self.function_arguments) > 30000 or len(self.function_name) > 100:
             raise ValueError('API response exceeded client size limit')
 
     def action(self):
-        from desktop_agent.protocol import normalize_call
+        from desktop_agent.protocol import InvalidToolCall, normalize_call
         if self.has_function:
             if not self.terminal or self.finish != 'tool_calls':
                 raise ValueError('Incomplete native tool call; no tool executed')
-            arguments = decode_api_event(self.function_arguments,'tool arguments')
-            self.reply_format = 'native_tool'
-            return normalize_call({'tool':self.function_name,'arguments':arguments},self.tool_names)
+            try:
+                arguments = decode_api_event(self.function_arguments,'tool arguments')
+                self.reply_format = 'native_tool'
+                return normalize_call({'tool':self.function_name,'arguments':arguments},self.tool_names)
+            except (ValueError,TypeError) as error:
+                raise InvalidToolCall(str(error)) from None
         valid = {'openai':('stop',),'responses':('completed',),'gemini':('STOP','FINISH_REASON_STOP'),'anthropic':('end_turn',)}
         if not self.terminal or self.finish not in valid[self.format]:
-            raise ValueError('Incomplete or rejected API response; no tool executed')
+            reason = ('output_limit' if self.finish in ('length','max_tokens','MAX_TOKENS') else
+                      'missing_completion' if not self.terminal else 'rejected_or_unsupported_finish')
+            raise IncompleteAPIResponse(reason)
         if not self.text.strip():
-            raise ValueError('API completed without answer text; no tool executed')
+            raise InvalidToolCall('API completed without answer text; no tool executed')
         text = self.text.strip().lstrip('\ufeff').strip()
         fenced = re.fullmatch(r'```(?:json)?[ \t]*\r?\n(.*?)\r?\n```',text,re.DOTALL|re.IGNORECASE)
         if fenced:
@@ -419,10 +451,13 @@ class StreamResult:
             action = json.loads(text)
         except ValueError:
             if fenced or text.startswith(('{','[','"','```','<think>','</think>')):
-                raise ValueError(f'Model action JSON is malformed (characters={len(self.text)}); no tool executed') from None
+                raise InvalidToolCall(f'Model action JSON is malformed (characters={len(self.text)}); no tool executed') from None
             self.reply_format = 'plain_text'
             action = {'message':self.text,'tool':'finish','arguments':{},'risk':'routine'}
-        return normalize_call(action,self.tool_names)
+        try:
+            return normalize_call(action,self.tool_names)
+        except (ValueError,TypeError) as error:
+            raise InvalidToolCall(str(error)) from None
 
 
 class APIClient:
@@ -467,6 +502,9 @@ class APIClient:
     def count(self, text):
         if self.config.native_tools:
             text += json.dumps(native_definitions(self.tool_names or default_tool_names()))
+        elif self.config.structured_output and uses_kaggle_schema(self.config):
+            from desktop_agent.protocol import compact_schema
+            text += json.dumps(compact_schema(self.tool_names or default_tool_names()))
         elif self.config.format == 'anthropic' and self.config.structured_output:
             text += json.dumps(compatible_schema(self.tool_names))
         if self.config.tokenizer == 'estimate':
@@ -502,7 +540,10 @@ class APIClient:
             raise ValueError('Vertex service-account authentication failed; check the imported JSON key and project access') from None
 
     def headers(self, key):
+        from desktop_agent.kaggle_server import is_ngrok_host
         headers = {'Content-Type':'application/json'}
+        if is_ngrok_host(urlsplit(endpoint(self.config)).hostname):
+            headers['ngrok-skip-browser-warning'] = '1'
         if self.config.format == 'gemini':
             headers['x-goog-api-key'] = key
         elif self.config.format == 'anthropic':
@@ -610,7 +651,8 @@ class APIClient:
                         elif status in (408,429,500,502,503,504,529):
                             self.cooldown_until = time.monotonic()+retry_delay(response.headers.get('retry-after'),attempt)
                             if attempt+1 >= attempts:
-                                raise ValueError(f'API HTTP {status}; retry limit reached ({attempts} request(s))')
+                                hint = await request_error_hint(response) if status == 503 and uses_kaggle_schema(self.config) else ''
+                                raise ValueError(f'API HTTP {status}; retry limit reached ({attempts} request(s))'+hint)
                             if status == 429 and not self.config.vertex:
                                 index = next((candidate%key_count for candidate in range(index+1,index+key_count+1)
                                               if candidate%key_count not in rejected_keys),index)
@@ -713,6 +755,10 @@ async def request_error_hint(response):
             body.extend(chunk)
             if len(body) > 16384:
                 return ''
+        if response.status_code == 503:
+            if b'no tunnel here' in body.lower():
+                return '; Kaggle tunnel URL is no longer active. Check the latest API_URL in the notebook and update the API profile; the model server may still be running.'
+            return ''
         data = json.loads(body)
         if not isinstance(data,dict):
             return ''

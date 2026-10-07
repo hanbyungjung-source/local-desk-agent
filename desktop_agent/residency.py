@@ -16,11 +16,80 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def deployment(model,projector):
-    runtime=models.Q2_FRONT_RUNTIME
+def front_profile(context_tokens,kv_cache_type,cache_ram_mib):
+    if type(context_tokens) is not int or not 4096 <= context_tokens <= 65536 or context_tokens%1024:
+        raise ValueError('Front context must be 4096..65536 in multiples of 1024')
+    if kv_cache_type not in ('default','q4_0','q8_0','f16'):
+        raise ValueError('Unsupported front KV type')
+    if type(cache_ram_mib) is not int or cache_ram_mib not in (0,2048):
+        raise ValueError('Unsupported front RAM cache size')
+    profile=dict(context_tokens=context_tokens,kv_cache_type='q8_0' if kv_cache_type=='default' else kv_cache_type,
+                 cache_ram_mib=cache_ram_mib,n_batch=512,n_ubatch=128,n_seq_max=1)
+    profile['identity']=hashlib.sha256(json.dumps(profile,sort_keys=True,separators=(',',':')).encode('ascii')).hexdigest()
+    return profile
+
+
+def gpu_adapters():
+    import ctypes
+    from ctypes import wintypes
+    import uuid
+    class Luid(ctypes.Structure):
+        _fields_=[('low',wintypes.DWORD),('high',wintypes.LONG)]
+    class Description(ctypes.Structure):
+        _fields_=[('name',wintypes.WCHAR*128),('vendor',wintypes.UINT),('device',wintypes.UINT),
+                  ('subsystem',wintypes.UINT),('revision',wintypes.UINT),('dedicated',ctypes.c_size_t),
+                  ('system',ctypes.c_size_t),('shared',ctypes.c_size_t),('luid',Luid),('flags',wintypes.UINT)]
+    def method(pointer,index,result,*arguments):
+        table=ctypes.cast(pointer,ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        return ctypes.WINFUNCTYPE(result,ctypes.c_void_p,*arguments)(table[index])
+    library=ctypes.WinDLL('dxgi',use_last_error=True)
+    library.CreateDXGIFactory1.argtypes=[ctypes.c_void_p,ctypes.POINTER(ctypes.c_void_p)]
+    library.CreateDXGIFactory1.restype=ctypes.c_long
+    identity=(ctypes.c_ubyte*16).from_buffer_copy(uuid.UUID('770aae78-f26f-4dba-a829-253c83d1b387').bytes_le)
+    factory=ctypes.c_void_p()
+    if library.CreateDXGIFactory1(identity,ctypes.byref(factory))!=0:
+        raise RuntimeError('DXGI factory unavailable')
+    rows=[]
+    try:
+        for index in range(16):
+            adapter=ctypes.c_void_p()
+            status=method(factory,12,ctypes.c_long,wintypes.UINT,ctypes.POINTER(ctypes.c_void_p))(factory,index,ctypes.byref(adapter))
+            if status & 0xffffffff==0x887a0002:
+                break
+            if status!=0:
+                raise RuntimeError('DXGI adapter enumeration failed')
+            try:
+                description=Description()
+                if method(adapter,10,ctypes.c_long,ctypes.POINTER(Description))(adapter,ctypes.byref(description))!=0:
+                    raise RuntimeError('DXGI adapter description failed')
+                rows.append(dict(name=description.name,vendor=description.vendor,device=description.device,
+                                 dedicated_bytes=description.dedicated,software=bool(description.flags & 2),
+                                 luid=f'luid_0x{description.luid.high & 0xffffffff:08X}_0x{description.luid.low:08X}_phys_0'))
+            finally:
+                method(adapter,2,wintypes.ULONG)(adapter)
+    finally:
+        method(factory,2,wintypes.ULONG)(factory)
+    return rows
+
+
+def profile_adapters(rows):
+    result={}
+    for name,vendor,device in (('rtx',0x10de,0x2d83),('rx',0x1002,0x6fdf)):
+        matched=[row for row in rows if not row['software'] and row['vendor']==vendor]
+        if len(matched)!=1 or matched[0]['device']!=device:
+            raise ValueError('Front profile requires one RTX5050 and one RX580 2048SP')
+        result[name+'_luid']=matched[0]['luid']
+    return result
+
+
+def deployment(model,projector,*,profile=None):
+    runtime=models.Q2_PROFILE_RUNTIME if profile is not None else models.Q2_FRONT_RUNTIME
     record=json.loads((runtime/'deployment.json').read_text(encoding='utf-8'))
-    if record.get('schema')!=1 or record.get('baseline_id')!='front_native_postencode':
+    expected_schema,expected_id=(2,'front_native_profiles_v1') if profile is not None else (1,'front_native_postencode')
+    if record.get('schema')!=expected_schema or record.get('baseline_id')!=expected_id:
         raise ValueError('Invalid front residency deployment')
+    if profile is not None and profile!=front_profile(profile['context_tokens'],profile['kv_cache_type'],profile['cache_ram_mib']):
+        raise ValueError('Invalid front profile identity')
     for kind,filename in (('model',model),('projector',projector)):
         expected=record[kind]
         path=Path(filename).resolve()
@@ -33,7 +102,7 @@ def deployment(model,projector):
         if Path(name).name!=name or sha256(runtime/name)!=digest:
             raise ValueError('Front runtime file mismatch: '+name)
     table=runtime/'workspace-table.json'
-    if sha256(table)!=record['table_sha256'] or json.loads(table.read_text())['identity']!=record['identity']:
+    if profile is None and (sha256(table)!=record['table_sha256'] or json.loads(table.read_text())['identity']!=record['identity']):
         raise ValueError('Front workspace table mismatch')
     child={key:value for key,value in os.environ.items() if not key.startswith(('GGML_','LOCAL_DESK_'))}
     for key in ('CUDA_LAUNCH_BLOCKING','CUDA_LOG_FILE','CUDA_VISIBLE_DEVICES','LLAMA_GRAPH_REUSE_DISABLE','LLAMA_MTP_IMAGE_PACKED'):
@@ -41,6 +110,17 @@ def deployment(model,projector):
     child.update(record['environment'])
     child.update(GGML_BACKEND_PATH=str(runtime/'ggml-vulkan.dll'),LOCAL_DESK_FRONT_TABLE=str(table),
         PATH=str(runtime)+os.pathsep+child.get('PATH',''))
+    if profile is not None:
+        if record.get('profile_planning')!='runtime_signature':
+            raise ValueError('Front profile planning contract mismatch')
+        expected_caps=dict(rtx_dedicated=7850*1024**2,rtx_shared=190*1024**2,available_ram=4*1024**3,headroom=32*1024**2)
+        if record.get('caps')!=expected_caps:
+            raise ValueError('Front profile memory caps differ from the native runtime')
+        record=dict(record,profile=profile,context_tokens=profile['context_tokens'],cache_ram_mib=profile['cache_ram_mib'],
+                    **profile_adapters(gpu_adapters()))
+        child.pop('LOCAL_DESK_FRONT_TABLE',None)
+        child.update(LOCAL_DESK_FRONT_DYNAMIC_PROFILE='1',LOCAL_DESK_FRONT_ID=profile['identity'],
+                     LOCAL_DESK_RTX_LUID=record['rtx_luid'])
     return record,child
 
 
